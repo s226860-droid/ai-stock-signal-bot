@@ -2118,6 +2118,270 @@ def calculate_trade_plan(score: Dict, market: Dict) -> Dict:
         "Take Profit 2": round(take_profit_2, 2),
     }
 
+
+# =========================
+# REGIME + RELATIVE STRENGTH + ALLOCATION ENGINE
+# =========================
+
+def get_market_regime_snapshot() -> Dict:
+    symbols = {
+        "SPY": "S&P 500",
+        "QQQ": "Nasdaq 100",
+        "^VIX": "VIX",
+        "^TNX": "10Y Yield",
+    }
+
+    data = {}
+
+    for symbol, name in symbols.items():
+        try:
+            df = yf.download(symbol, period="1y", progress=False, auto_adjust=True)
+
+            if df.empty:
+                continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            df["ma_20"] = df["Close"].rolling(20).mean()
+            df["ma_50"] = df["Close"].rolling(50).mean()
+            df["ma_200"] = df["Close"].rolling(200).mean()
+            df["return_5d"] = df["Close"].pct_change(5)
+            df["return_20d"] = df["Close"].pct_change(20)
+
+            latest = df.iloc[-1]
+
+            data[symbol] = {
+                "name": name,
+                "price": float(latest["Close"]),
+                "ma_20": float(latest["ma_20"]) if not pd.isna(latest["ma_20"]) else None,
+                "ma_50": float(latest["ma_50"]) if not pd.isna(latest["ma_50"]) else None,
+                "ma_200": float(latest["ma_200"]) if not pd.isna(latest["ma_200"]) else None,
+                "return_5d": float(latest["return_5d"]) if not pd.isna(latest["return_5d"]) else 0,
+                "return_20d": float(latest["return_20d"]) if not pd.isna(latest["return_20d"]) else 0,
+            }
+
+        except Exception:
+            pass
+
+    score = 50
+    reasons = []
+
+    spy = data.get("SPY")
+    qqq = data.get("QQQ")
+    vix = data.get("^VIX")
+    tnx = data.get("^TNX")
+
+    for item, label in [(spy, "SPY"), (qqq, "QQQ")]:
+        if not item:
+            continue
+
+        if item["ma_50"] and item["price"] > item["ma_50"]:
+            score += 12
+            reasons.append(f"{label} is above its 50-day moving average.")
+        else:
+            score -= 12
+            reasons.append(f"{label} is below its 50-day moving average.")
+
+        if item["ma_200"] and item["price"] > item["ma_200"]:
+            score += 10
+            reasons.append(f"{label} is above its 200-day moving average.")
+        else:
+            score -= 10
+            reasons.append(f"{label} is below its 200-day moving average.")
+
+        if item["return_20d"] > 0.04:
+            score += 6
+            reasons.append(f"{label} has positive 20-day momentum.")
+        elif item["return_20d"] < -0.04:
+            score -= 8
+            reasons.append(f"{label} has weak 20-day momentum.")
+
+    if vix:
+        if vix["price"] > 30:
+            score -= 25
+            reasons.append("VIX is above 30, suggesting panic or high volatility.")
+        elif vix["price"] > 22:
+            score -= 12
+            reasons.append("VIX is elevated, suggesting risk-off conditions.")
+        elif vix["price"] < 17:
+            score += 8
+            reasons.append("VIX is low, suggesting calmer market conditions.")
+
+    if tnx and tnx["return_20d"] > 0.10:
+        score -= 8
+        reasons.append("10Y yield has risen sharply, which can pressure growth stocks.")
+
+    score = clamp(score)
+
+    if score >= 75:
+        regime = "BULL"
+        max_exposure = 0.95
+        cash_minimum = 0.05
+    elif score >= 55:
+        regime = "NEUTRAL"
+        max_exposure = 0.70
+        cash_minimum = 0.30
+    elif score >= 35:
+        regime = "BEAR"
+        max_exposure = 0.35
+        cash_minimum = 0.65
+    else:
+        regime = "PANIC"
+        max_exposure = 0.10
+        cash_minimum = 0.90
+
+    return {
+        "regime": regime,
+        "score": round(score, 1),
+        "max_exposure": max_exposure,
+        "cash_minimum": cash_minimum,
+        "reasons": reasons[:6],
+        "data": data,
+    }
+
+def calculate_relative_strength(ticker: str) -> Dict:
+    try:
+        stock = yf.download(ticker, period="6mo", progress=False, auto_adjust=True)
+        spy = yf.download("SPY", period="6mo", progress=False, auto_adjust=True)
+        qqq = yf.download("QQQ", period="6mo", progress=False, auto_adjust=True)
+
+        for df in [stock, spy, qqq]:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+        if stock.empty or spy.empty or qqq.empty:
+            return {"RS vs SPY": 0, "RS vs QQQ": 0, "RS Score": 50}
+
+        stock_20 = stock["Close"].pct_change(20).iloc[-1]
+        spy_20 = spy["Close"].pct_change(20).iloc[-1]
+        qqq_20 = qqq["Close"].pct_change(20).iloc[-1]
+
+        rs_spy = (stock_20 - spy_20) * 100
+        rs_qqq = (stock_20 - qqq_20) * 100
+
+        rs_score = 50 + (rs_spy * 2.0) + (rs_qqq * 1.5)
+
+        return {
+            "RS vs SPY": round(float(rs_spy), 2),
+            "RS vs QQQ": round(float(rs_qqq), 2),
+            "RS Score": round(clamp(float(rs_score)), 1),
+        }
+
+    except Exception:
+        return {"RS vs SPY": 0, "RS vs QQQ": 0, "RS Score": 50}
+
+def calculate_portfolio_heat(pro_df: pd.DataFrame, regime: Dict) -> Dict:
+    if pro_df.empty:
+        return {"heat": 0, "label": "EMPTY", "warnings": []}
+
+    allocation = pro_df["Suggested Allocation %"].sum()
+    high_risk_count = int(pro_df["Risk"].isin(["HIGH", "VERY HIGH"]).sum())
+    avg_score = float(pro_df["Score"].mean())
+    cash_minimum = regime.get("cash_minimum", 0.30) * 100
+
+    sector_exposure = (
+        pro_df[pro_df["Suggested Allocation %"] > 0]
+        .groupby("Sector")["Suggested Allocation %"]
+        .sum()
+        .sort_values(ascending=False)
+    )
+
+    heat = 0
+    warnings = []
+
+    heat += min(allocation, 100) * 0.45
+    heat += high_risk_count * 4
+
+    if regime["regime"] in ["BEAR", "PANIC"]:
+        heat += 25
+        warnings.append("Market regime is defensive, so high exposure is risky.")
+
+    if allocation > (100 - cash_minimum):
+        heat += 20
+        warnings.append("Suggested allocation is above the regime-based exposure limit.")
+
+    if not sector_exposure.empty and sector_exposure.iloc[0] > 35:
+        heat += 15
+        warnings.append(f"Portfolio is concentrated in {sector_exposure.index[0]}.")
+
+    if avg_score < 55:
+        heat += 10
+        warnings.append("Average score is not strong enough for aggressive exposure.")
+
+    heat = clamp(heat)
+
+    if heat >= 80:
+        label = "VERY HOT"
+    elif heat >= 60:
+        label = "HOT"
+    elif heat >= 35:
+        label = "MODERATE"
+    else:
+        label = "COOL"
+
+    return {
+        "heat": round(heat, 1),
+        "label": label,
+        "warnings": warnings,
+    }
+
+def capital_allocation_engine(pro_df: pd.DataFrame, regime: Dict) -> pd.DataFrame:
+    if pro_df.empty:
+        return pd.DataFrame()
+
+    df = pro_df.copy()
+
+    df["RS Score"] = df["Ticker"].apply(lambda t: calculate_relative_strength(t)["RS Score"])
+    df["Combined Allocation Score"] = (
+        df["Risk Adjusted Score"] * 0.45 +
+        df["Confidence"] * 0.20 +
+        df["RS Score"] * 0.25 +
+        df["Score"] * 0.10
+    )
+
+    risk_multiplier = {
+        "LOW": 1.0,
+        "MEDIUM": 0.8,
+        "HIGH": 0.55,
+        "VERY HIGH": 0.30,
+    }
+
+    df["Risk Multiplier"] = df["Risk"].map(risk_multiplier).fillna(0.5)
+    df["Adjusted Weight Score"] = df["Combined Allocation Score"] * df["Risk Multiplier"]
+
+    df = df[
+        (df["Trade Plan"].isin(["BUY", "WATCH"])) &
+        (df["Risk Adjusted Score"] >= 62) &
+        (df["Confidence"] >= 45)
+    ].copy()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    max_exposure = regime.get("max_exposure", 0.70) * 100
+    max_single = 14 if regime["regime"] == "BULL" else 9 if regime["regime"] == "NEUTRAL" else 5
+
+    total_weight = df["Adjusted Weight Score"].sum()
+
+    if total_weight <= 0:
+        return pd.DataFrame()
+
+    df["Target Allocation %"] = df["Adjusted Weight Score"] / total_weight * max_exposure
+    df["Target Allocation %"] = df["Target Allocation %"].clip(upper=max_single)
+
+    # Re-normalize after capping.
+    capped_total = df["Target Allocation %"].sum()
+    if capped_total > max_exposure:
+        df["Target Allocation %"] = df["Target Allocation %"] / capped_total * max_exposure
+
+    df = df.sort_values("Target Allocation %", ascending=False)
+
+    return df[[
+        "Ticker", "Company", "Sector", "Target Allocation %",
+        "Risk Adjusted Score", "RS Score", "Confidence", "Risk", "Trade Plan"
+    ]]
+
 # =========================
 # PROFESSIONAL ANALYTICS
 # =========================
@@ -2299,10 +2563,15 @@ def build_professional_table(db: Database, watchlist: Dict) -> pd.DataFrame:
         allocation = suggested_allocation(score, risk)
         trade_plan = calculate_trade_plan(score, market)
 
+        rs = calculate_relative_strength(ticker)
+
         rows.append({
             "Ticker": ticker,
             "Company": company,
             "Sector": SECTOR_MAP.get(ticker, "Other"),
+            "Relative Strength vs SPY": rs["RS vs SPY"],
+            "Relative Strength vs QQQ": rs["RS vs QQQ"],
+            "Relative Strength Score": rs["RS Score"],
             "Price": float(market.get("close") or 0),
             "Score": float(score.get("final_score") or 0),
             "Risk Adjusted Score": trade_plan["Risk Adjusted Score"],
@@ -2730,6 +2999,73 @@ def run_dashboard():
                 st.write("Signal reasons:")
                 for reason in score.get("reasons", []):
                     st.write(f"- {reason}")
+
+
+
+    with tab7:
+        st.subheader("Market Regime & Capital Allocation Engine")
+        st.caption("This section decides how aggressive the algorithm should be based on market conditions, relative strength, and portfolio heat.")
+
+        regime = get_market_regime_snapshot()
+
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Market Regime", regime["regime"])
+        r2.metric("Regime Score", f"{regime['score']:.1f}/100")
+        r3.metric("Max Exposure", f"{regime['max_exposure'] * 100:.0f}%")
+        r4.metric("Minimum Cash", f"{regime['cash_minimum'] * 100:.0f}%")
+
+        st.write("Regime reasons:")
+        for reason in regime["reasons"]:
+            st.write(f"- {reason}")
+
+        pro_df = build_professional_table(db, active_watchlist)
+
+        if pro_df.empty:
+            st.info("No allocation data available yet. Refresh data first.")
+        else:
+            allocation_df = capital_allocation_engine(pro_df, regime)
+            heat = calculate_portfolio_heat(pro_df, regime)
+
+            h1, h2 = st.columns(2)
+            h1.metric("Portfolio Heat", f"{heat['heat']:.1f}/100")
+            h2.metric("Heat Label", heat["label"])
+
+            if heat["warnings"]:
+                st.warning(" ".join(heat["warnings"]))
+            else:
+                st.success("Portfolio heat is controlled under the current regime.")
+
+            st.subheader("Capital Allocation Plan")
+
+            if allocation_df.empty:
+                st.info("No stocks qualify for allocation under the current risk rules. Cash is preferred.")
+            else:
+                st.dataframe(
+                    allocation_df,
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Target Allocation %": st.column_config.NumberColumn("Target Allocation %", format="%.1f%%"),
+                        "Risk Adjusted Score": st.column_config.ProgressColumn("Risk Adjusted Score", min_value=0, max_value=100, format="%.1f"),
+                        "RS Score": st.column_config.ProgressColumn("Relative Strength", min_value=0, max_value=100, format="%.1f"),
+                        "Confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100, format="%.1f%%"),
+                    },
+                )
+
+                st.bar_chart(allocation_df.set_index("Ticker")["Target Allocation %"], width="stretch")
+
+            st.subheader("Relative Strength Rankings")
+            rs_cols = [
+                "Ticker", "Company", "Sector",
+                "Relative Strength vs SPY", "Relative Strength vs QQQ",
+                "Relative Strength Score", "Risk Adjusted Score", "Confidence", "Risk"
+            ]
+            available_cols = [c for c in rs_cols if c in pro_df.columns]
+            st.dataframe(
+                pro_df[available_cols].sort_values("Relative Strength Score", ascending=False),
+                width="stretch",
+                hide_index=True,
+            )
 
 
 # =========================
