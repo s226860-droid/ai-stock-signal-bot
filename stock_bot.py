@@ -49,7 +49,7 @@ WATCHLIST = {
     "AAPL": "Apple",
     "MSFT": "Microsoft",
     "NVDA": "Nvidia",
-    "AMD": "AMD",
+    "AMD": "Advanced Micro Devices",
     "TSLA": "Tesla",
     "META": "Meta Platforms",
     "GOOGL": "Alphabet Google",
@@ -72,10 +72,36 @@ WATCHLIST = {
     "COST": "Costco",
     "WMT": "Walmart",
     "HD": "Home Depot",
+    "BRK-B": "Berkshire Hathaway",
+    "TSM": "Taiwan Semiconductor",
+    "ASML": "ASML Holding",
+    "AMAT": "Applied Materials",
+    "MU": "Micron Technology",
+    "ARM": "Arm Holdings",
+    "QCOM": "Qualcomm",
+    "TXN": "Texas Instruments",
+    "INTU": "Intuit",
+    "NOW": "ServiceNow",
+    "PANW": "Palo Alto Networks",
+    "CRWD": "CrowdStrike",
+    "VRT": "Vertiv",
+    "MRVL": "Marvell Technology",
+    "VEEV": "Veeva Systems",
+    "BKNG": "Booking Holdings",
+    "ABNB": "Airbnb",
+    "DIS": "Disney",
+    "PEP": "PepsiCo",
+    "MCD": "McDonald's",
+    "CAT": "Caterpillar",
+    "GE": "GE Aerospace",
+    "RTX": "RTX",
+    "NKE": "Nike",
+    "PFE": "Pfizer",
+    "ABBV": "AbbVie",
+    "ISRG": "Intuitive Surgical",
     "SPY": "S&P 500 ETF",
     "QQQ": "Nasdaq 100 ETF",
 }
-
 DB_PATH = "stock_bot.db"
 
 STARTING_CASH = 10_000
@@ -99,6 +125,65 @@ MARKET_TERMS = [
     "market", "nasdaq", "nyse", "investor", "dividend", "valuation",
     "ai", "chip", "cloud", "sales", "quarter", "growth"
 ]
+
+
+COMPANY_DESCRIPTIONS = {
+    "AAPL": "Apple makes iPhones, Macs, wearables, services, and consumer software. It is a mega-cap technology company driven by hardware cycles, services revenue, AI features, and consumer demand.",
+    "MSFT": "Microsoft sells cloud infrastructure, Windows, Office, enterprise software, gaming, and AI tools. Its stock is heavily influenced by Azure growth, enterprise spending, and AI adoption.",
+    "NVDA": "Nvidia designs GPUs and AI accelerators used in data centers, gaming, and professional computing. Its stock is closely tied to AI infrastructure demand and chip supply.",
+    "AMD": "AMD designs CPUs, GPUs, and data center chips. It competes with Nvidia and Intel and is influenced by AI chip demand, PC cycles, and server growth.",
+    "TSLA": "Tesla makes electric vehicles, batteries, energy storage products, and autonomous driving software. Its stock moves on deliveries, margins, robotaxi expectations, and EV demand.",
+    "META": "Meta owns Facebook, Instagram, WhatsApp, Threads, and major AI/reality-labs projects. Its stock is driven by ad growth, user engagement, AI spending, and margins.",
+    "GOOGL": "Alphabet owns Google Search, YouTube, Android, Google Cloud, and AI products. Its stock is driven by ad demand, cloud growth, AI competition, and regulation.",
+    "AMZN": "Amazon runs e-commerce, logistics, advertising, Prime, and AWS cloud. Its stock is driven by AWS growth, retail margins, ads, and consumer spending.",
+    "PLTR": "Palantir builds data analytics and AI platforms for governments and enterprises. Its stock is driven by AI software demand, contract growth, and valuation expectations.",
+    "COIN": "Coinbase is a crypto exchange and infrastructure company. Its stock is heavily influenced by Bitcoin prices, crypto trading volume, regulation, and institutional adoption.",
+    "JPM": "JPMorgan Chase is one of the largest banks in the world. Its stock is driven by interest rates, credit risk, loan growth, investment banking, and the broader economy.",
+    "XOM": "Exxon Mobil is a global energy company focused on oil, natural gas, refining, and chemicals. Its stock is driven by oil prices, energy demand, and geopolitical risk.",
+    "AVGO": "Broadcom designs semiconductors and infrastructure software. Its stock is driven by AI networking chips, custom silicon, cloud demand, and software integration.",
+    "NFLX": "Netflix is a global streaming entertainment company. Its stock is driven by subscriber growth, ad-tier adoption, pricing power, and content spending.",
+    "CRM": "Salesforce sells cloud software for sales, service, marketing, and data. Its stock is driven by enterprise software demand, AI tools, margins, and subscription growth.",
+    "ORCL": "Oracle sells enterprise software, databases, and cloud infrastructure. Its stock is driven by cloud growth, AI data-center demand, and enterprise contracts.",
+    "ADBE": "Adobe sells creative, document, and marketing software. Its stock is driven by subscription growth, AI creative tools, and competition.",
+    "UBER": "Uber operates ride-sharing, delivery, freight, and mobility platforms. Its stock is driven by bookings growth, margins, autonomous vehicle risk, and consumer demand.",
+    "SHOP": "Shopify provides e-commerce software and merchant tools. Its stock is driven by online retail growth, merchant services, payments, and operating leverage.",
+    "LLY": "Eli Lilly is a pharmaceutical company known for diabetes, obesity, and other medicines. Its stock is driven by drug demand, trial data, approvals, and pricing.",
+    "UNH": "UnitedHealth is a large health insurance and healthcare services company. Its stock is influenced by medical costs, regulation, enrollment, and healthcare margins.",
+    "V": "Visa runs one of the largest global payment networks. Its stock is driven by consumer spending, cross-border transactions, and payment volume.",
+    "MA": "Mastercard operates a global payments network. Its stock is driven by consumer spending, international travel, and payment volume growth.",
+    "COST": "Costco runs membership-based warehouse stores. Its stock is driven by same-store sales, membership renewals, margins, and consumer strength.",
+    "WMT": "Walmart is a global retail giant. Its stock is driven by grocery demand, e-commerce growth, margins, and consumer spending.",
+    "HD": "Home Depot is a major home improvement retailer. Its stock is driven by housing activity, renovation demand, interest rates, and consumer confidence.",
+    "BRK-B": "Berkshire Hathaway is a diversified holding company led by Warren Buffett's investment model. It owns insurance, railroads, utilities, industrial businesses, and a large stock portfolio.",
+    "TSM": "Taiwan Semiconductor Manufacturing is the world's leading chip foundry. It manufactures advanced chips for companies like Nvidia, Apple, AMD, and others.",
+    "ASML": "ASML makes extreme ultraviolet lithography machines used to manufacture advanced semiconductors. It is critical to the global chip supply chain.",
+    "AMAT": "Applied Materials sells equipment and services used in semiconductor manufacturing. Its stock is tied to chip factory spending and AI hardware demand.",
+    "MU": "Micron makes memory and storage chips. Its stock is cyclical and driven by DRAM/NAND pricing, AI memory demand, and data center spending.",
+    "ARM": "Arm designs chip architecture used in mobile devices, data centers, and AI hardware. Its stock is influenced by licensing growth and semiconductor demand.",
+    "QCOM": "Qualcomm designs mobile and wireless chips. Its stock is driven by smartphone cycles, automotive chips, AI devices, and licensing revenue.",
+    "TXN": "Texas Instruments makes analog and embedded chips used across industrial, automotive, and electronics markets.",
+    "INTU": "Intuit makes TurboTax, QuickBooks, Credit Karma, and financial software. Its stock is driven by small business activity and tax/software demand.",
+    "NOW": "ServiceNow provides workflow automation software for enterprises. Its stock is driven by cloud software demand, AI workflow tools, and subscription growth.",
+    "PANW": "Palo Alto Networks is a cybersecurity company. Its stock is driven by enterprise security spending, platform adoption, and cyber risk.",
+    "CRWD": "CrowdStrike provides cloud-based cybersecurity software. Its stock is driven by endpoint security demand, retention, and enterprise growth.",
+    "VRT": "Vertiv provides power and cooling infrastructure for data centers. Its stock is closely linked to AI data center construction and electrical infrastructure demand.",
+    "MRVL": "Marvell designs chips for data centers, networking, storage, and custom AI silicon. Its stock is driven by AI infrastructure demand and cloud chip projects.",
+    "VEEV": "Veeva provides cloud software for life sciences companies. Its stock is driven by pharmaceutical software spending and regulated industry demand.",
+    "BKNG": "Booking Holdings runs travel platforms like Booking.com, Priceline, Agoda, and OpenTable. Its stock is driven by global travel demand.",
+    "ABNB": "Airbnb operates a marketplace for short-term stays and experiences. Its stock is driven by travel demand, supply growth, regulation, and bookings.",
+    "DIS": "Disney owns film studios, theme parks, ESPN, streaming, and consumer brands. Its stock is driven by parks, streaming profitability, sports, and content.",
+    "PEP": "PepsiCo sells beverages and snacks globally. Its stock is defensive and driven by pricing power, volumes, and consumer staples demand.",
+    "MCD": "McDonald's is a global fast-food franchise company. Its stock is driven by same-store sales, pricing power, margins, and global consumer demand.",
+    "CAT": "Caterpillar makes construction, mining, and industrial equipment. Its stock is cyclical and driven by infrastructure, commodities, and global growth.",
+    "GE": "GE Aerospace makes jet engines and aerospace systems. Its stock is driven by aviation demand, engine services, and defense/commercial aircraft cycles.",
+    "RTX": "RTX is an aerospace and defense company. Its stock is driven by defense spending, aircraft systems, missiles, and engine demand.",
+    "NKE": "Nike sells athletic footwear, apparel, and equipment. Its stock is driven by consumer demand, brand strength, margins, and China/US sales.",
+    "PFE": "Pfizer is a pharmaceutical company. Its stock is driven by drug pipeline progress, approvals, vaccine demand, and patent cycles.",
+    "ABBV": "AbbVie is a pharmaceutical company focused on immunology, oncology, aesthetics, and neuroscience. Its stock is driven by drug sales and pipeline execution.",
+    "ISRG": "Intuitive Surgical makes robotic surgery systems. Its stock is driven by procedure growth, system placements, and healthcare technology adoption.",
+    "SPY": "SPY tracks the S&P 500 index and is used as a broad-market benchmark.",
+    "QQQ": "QQQ tracks the Nasdaq-100 index and is used as a growth/technology-heavy benchmark.",
+}
 
 MACRO_RSS_FEEDS = {
     "Federal Reserve": "https://www.federalreserve.gov/feeds/press_all.xml",
@@ -1399,7 +1484,7 @@ class StockBot:
         except Exception as e:
             print(f"Macro news failed: {e}")
 
-        for ticker, company in WATCHLIST.items():
+        for ticker, company in active_watchlist.items():
             print(f"\nUpdating {ticker} - {company}")
 
             try:
@@ -1882,21 +1967,64 @@ def run_dashboard():
     db = Database()
     trader = PaperTrader(db)
 
+    if "custom_watchlist" not in st.session_state:
+        st.session_state.custom_watchlist = {}
+
+    active_watchlist = dict(WATCHLIST)
+    active_watchlist.update(st.session_state.custom_watchlist)
+
     st.sidebar.title("Dashboard Controls")
-    st.sidebar.caption("Use refresh when you want the newest prices, news, and AI scores.")
+    st.sidebar.caption("Refresh pulls newest prices, company news, official macro feeds, and AI scores.")
     auto_refresh = True
     selected_period = st.sidebar.selectbox("Chart period", ["1mo", "3mo", "6mo", "1y", "2y"], index=1)
     selected_chart_type = st.sidebar.selectbox("Chart type", ["Close price", "Volume", "Close + moving averages"], index=0)
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Add a Stock")
+    custom_ticker = st.sidebar.text_input("Ticker symbol", placeholder="Example: SMCI").upper().strip()
+    custom_name = st.sidebar.text_input("Company name", placeholder="Example: Super Micro Computer").strip()
+
+    if st.sidebar.button("Add Stock to Dashboard"):
+        if custom_ticker:
+            if not custom_name:
+                custom_name = custom_ticker
+            st.session_state.custom_watchlist[custom_ticker] = custom_name
+
+            with st.spinner(f"Adding {custom_ticker}..."):
+                try:
+                    market = MarketDataCollector(db)
+                    news = NewsCollector(db)
+                    scorer = StockScorer(db)
+
+                    market.fetch(custom_ticker)
+                    news.fetch_for_ticker(custom_ticker, custom_name)
+                    scorer.score_stock(custom_ticker, custom_name)
+                    st.success(f"Added {custom_ticker}.")
+                except Exception as e:
+                    st.error(f"Could not add {custom_ticker}: {e}")
+            st.rerun()
 
     if st.sidebar.button("Refresh All Data"):
         with st.spinner("Updating prices, news, trends, and scores..."):
             bot = StockBot()
             bot.run_daily_update()
+
+            for t, name in st.session_state.custom_watchlist.items():
+                try:
+                    market = MarketDataCollector(db)
+                    news = NewsCollector(db)
+                    scorer = StockScorer(db)
+                    market.fetch(t)
+                    news.fetch_for_ticker(t, name)
+                    scorer.score_stock(t, name)
+                except Exception:
+                    pass
+
         st.success("Data refreshed.")
         st.rerun()
 
     existing_rows = []
-    for ticker in WATCHLIST:
+    for ticker in active_watchlist:
         if db.latest_market_row(ticker) and db.latest_score(ticker):
             existing_rows.append(ticker)
 
@@ -1908,7 +2036,7 @@ def run_dashboard():
 
     rows = []
 
-    for ticker, company in WATCHLIST.items():
+    for ticker, company in active_watchlist.items():
         score = db.latest_score(ticker)
         market = db.latest_market_row(ticker)
 
@@ -1954,6 +2082,22 @@ def run_dashboard():
     m4.metric("Avg Score", f"{avg_score:.1f}")
     m5.metric("Top", f"{top['Ticker']}", f"{top['Score']:.1f}")
     m6.metric("Weakest", f"{bottom['Ticker']}", f"{bottom['Score']:.1f}")
+
+    st.subheader("Portfolio Change Tracker")
+    st.caption("This will become more useful after the app has multiple days of saved paper-trading history. Right now it is the first live-tracking stage.")
+
+    current_value = trader.portfolio_value()
+    start_value = STARTING_CASH
+    portfolio_change = current_value - start_value
+    portfolio_change_pct = (current_value / start_value - 1) * 100 if start_value else 0
+
+    pc1, pc2, pc3 = st.columns(3)
+    pc1.metric("Starting Value", f"${start_value:,.2f}")
+    pc2.metric("Current Value", f"${current_value:,.2f}")
+    pc3.metric("Total Change", f"${portfolio_change:,.2f}", f"{portfolio_change_pct:.2f}%")
+
+    if abs(portfolio_change) < 1:
+        st.info("No real portfolio movement yet because the app has just started tracking. As paper trades happen, this section will show gains, losses, and portfolio changes.")
 
     st.divider()
 
@@ -2004,6 +2148,8 @@ def run_dashboard():
 
     with tab2:
         selected = st.selectbox("Choose a stock to inspect", df["Ticker"].tolist(), index=0)
+
+        st.info(COMPANY_DESCRIPTIONS.get(selected, f"{selected} is a user-added stock. The dashboard will score it using price, volume, trend, macro, and available company news."))
 
         selected_score = db.latest_score(selected)
         selected_market = db.latest_market_row(selected)
@@ -2137,6 +2283,9 @@ def run_dashboard():
                 continue
 
             with st.expander(f"{ticker} | ${float(market.get('close') or 0):,.2f} | Score {float(score.get('final_score') or 0):.1f} | {score.get('signal')}"):
+                st.write("Company description:")
+                st.info(COMPANY_DESCRIPTIONS.get(ticker, f"{ticker} is a user-added stock. The app will analyze its price, volume, trend, and available news data."))
+                st.write("Signal reasons:")
                 for reason in score.get("reasons", []):
                     st.write(f"- {reason}")
 
@@ -2149,7 +2298,7 @@ def run_backtest():
     backtester = Backtester()
     results = []
 
-    for ticker in WATCHLIST:
+    for ticker in active_watchlist:
         result = backtester.simple_momentum_backtest(ticker)
         results.append(result)
 
