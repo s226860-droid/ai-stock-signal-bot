@@ -1278,11 +1278,26 @@ class StockBot:
 
 def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> Dict:
     prices = {}
-    score_rows = []
+    market_context = {}
 
-    for ticker, company in WATCHLIST.items():
+    # Download enough data for 180 trading days plus indicator warmup.
+    download_period = "1y"
+
+    context_symbols = {
+        "SPY": "S&P 500",
+        "QQQ": "Nasdaq 100",
+        "^VIX": "VIX volatility index",
+        "^TNX": "10Y treasury yield",
+        "CL=F": "Oil futures",
+        "BTC-USD": "Bitcoin",
+    }
+
+    all_symbols = dict(WATCHLIST)
+    all_symbols.update(context_symbols)
+
+    for ticker, company in all_symbols.items():
         try:
-            df = yf.download(ticker, period="90d", progress=False, auto_adjust=True)
+            df = yf.download(ticker, period=download_period, progress=False, auto_adjust=True)
 
             if df.empty:
                 continue
@@ -1290,16 +1305,20 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
-            df = df.tail(days + 20).copy()
-
+            df = df.copy()
             df["return_1d"] = df["Close"].pct_change()
             df["return_5d"] = df["Close"].pct_change(5)
             df["return_20d"] = df["Close"].pct_change(20)
             df["ma_20"] = df["Close"].rolling(20).mean()
             df["ma_50"] = df["Close"].rolling(50).mean()
+            df["ma_200"] = df["Close"].rolling(200).mean()
+            df["volatility_20d"] = df["return_1d"].rolling(20).std()
             df["volume_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
 
-            prices[ticker] = df
+            if ticker in WATCHLIST:
+                prices[ticker] = df
+            else:
+                market_context[ticker] = df
 
         except Exception:
             continue
@@ -1309,6 +1328,8 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
             "summary": {},
             "portfolio_history": pd.DataFrame(),
             "trades": pd.DataFrame(),
+            "explanations": pd.DataFrame(),
+            "benchmark": pd.DataFrame(),
         }
 
     common_dates = sorted(set.intersection(*[set(df.index) for df in prices.values()]))
@@ -1318,8 +1339,62 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
     positions = {}
     portfolio_history = []
     trades = []
+    max_positions = 5
+    max_position_fraction = 0.20
+    stop_loss = -0.08
+    trailing_stop = -0.10
+
+    def get_market_regime(current_date):
+        spy = market_context.get("SPY")
+        qqq = market_context.get("QQQ")
+        vix = market_context.get("^VIX")
+        tnx = market_context.get("^TNX")
+
+        score = 50
+        notes = []
+
+        if spy is not None and current_date in spy.index:
+            row = spy.loc[current_date]
+            if row["Close"] > row["ma_50"]:
+                score += 15
+                notes.append("SPY traded above its 50-day moving average.")
+            else:
+                score -= 15
+                notes.append("SPY traded below its 50-day moving average.")
+
+            if float(row.get("return_5d") or 0) < -0.03:
+                score -= 10
+                notes.append("SPY had weak 5-day momentum.")
+
+        if qqq is not None and current_date in qqq.index:
+            row = qqq.loc[current_date]
+            if row["Close"] > row["ma_50"]:
+                score += 10
+                notes.append("QQQ traded above its 50-day moving average.")
+            else:
+                score -= 10
+                notes.append("QQQ traded below its 50-day moving average.")
+
+            if float(row.get("return_5d") or 0) < -0.04:
+                score -= 10
+                notes.append("QQQ had weak 5-day momentum.")
+
+        if vix is not None and current_date in vix.index:
+            vix_5d = float(vix.loc[current_date].get("return_5d") or 0)
+            if vix_5d > 0.15:
+                score -= 15
+                notes.append("VIX rose sharply, suggesting risk-off market pressure.")
+
+        if tnx is not None and current_date in tnx.index:
+            rate_5d = float(tnx.loc[current_date].get("return_5d") or 0)
+            if rate_5d > 0.08:
+                score -= 8
+                notes.append("10-year Treasury yield rose, which can pressure growth stocks.")
+
+        return clamp(score), notes
 
     for current_date in common_dates:
+        regime_score, regime_notes = get_market_regime(current_date)
         daily_scores = []
 
         for ticker, df in prices.items():
@@ -1327,31 +1402,48 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
                 continue
 
             row = df.loc[current_date]
-
             price = float(row["Close"])
             r5 = float(row.get("return_5d") or 0)
             r20 = float(row.get("return_20d") or 0)
             volume_ratio = float(row.get("volume_ratio") or 1)
             ma20 = float(row.get("ma_20") or 0)
+            ma50 = float(row.get("ma_50") or 0)
+            vol = float(row.get("volatility_20d") or 0)
 
             momentum_score = 50
-            momentum_score += normalize_percent(r5, -0.10, 0.10) * 0.30 - 15
-            momentum_score += normalize_percent(r20, -0.20, 0.20) * 0.40 - 20
+            momentum_score += normalize_percent(r5, -0.10, 0.10) * 0.25 - 12.5
+            momentum_score += normalize_percent(r20, -0.20, 0.20) * 0.35 - 17.5
 
             if ma20 and price > ma20:
-                momentum_score += 10
+                momentum_score += 8
             else:
-                momentum_score -= 5
+                momentum_score -= 6
+
+            if ma50 and price > ma50:
+                momentum_score += 8
+            else:
+                momentum_score -= 8
 
             volume_score = 50
             if volume_ratio > 1.8 and r5 > 0:
                 volume_score = 75
             elif volume_ratio > 1.8 and r5 < 0:
-                volume_score = 35
+                volume_score = 30
             elif volume_ratio > 1.2:
                 volume_score = 60
 
-            simulated_score = clamp(momentum_score * 0.70 + volume_score * 0.30)
+            volatility_penalty = 0
+            if vol > 0.045:
+                volatility_penalty = 10
+            elif vol > 0.035:
+                volatility_penalty = 5
+
+            simulated_score = clamp(
+                momentum_score * 0.55 +
+                volume_score * 0.20 +
+                regime_score * 0.25 -
+                volatility_penalty
+            )
 
             daily_scores.append({
                 "ticker": ticker,
@@ -1360,19 +1452,35 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
                 "r5": r5,
                 "r20": r20,
                 "volume_ratio": volume_ratio,
+                "volatility": vol,
             })
 
         daily_scores = sorted(daily_scores, key=lambda x: x["score"], reverse=True)
 
-        # Sell weak positions
+        # Sell rules: score breakdown, stop loss, trailing stop, and weak market regime.
         for ticker in list(positions.keys()):
             matching = [x for x in daily_scores if x["ticker"] == ticker]
             if not matching:
                 continue
 
             data = matching[0]
+            pos = positions[ticker]
+            current_return = (data["price"] / pos["avg_price"]) - 1
+            pos["highest_price"] = max(pos.get("highest_price", pos["avg_price"]), data["price"])
+            drawdown_from_high = (data["price"] / pos["highest_price"]) - 1
+
+            sell_reason = None
 
             if data["score"] < 45:
+                sell_reason = "algorithm score dropped below risk threshold"
+            elif current_return <= stop_loss:
+                sell_reason = "stop loss triggered"
+            elif drawdown_from_high <= trailing_stop:
+                sell_reason = "trailing stop triggered"
+            elif regime_score < 35 and data["score"] < 55:
+                sell_reason = "market regime turned defensive"
+
+            if sell_reason:
                 shares = positions[ticker]["shares"]
                 proceeds = shares * data["price"]
                 cash += proceeds
@@ -1385,41 +1493,50 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
                     "Shares": round(shares, 4),
                     "Value": round(proceeds, 2),
                     "Score": round(data["score"], 1),
+                    "Reason": sell_reason,
                 })
 
                 del positions[ticker]
 
-        # Buy top names with score above 62
-        candidates = [x for x in daily_scores if x["score"] >= 62 and x["ticker"] not in positions]
-        max_positions = 5
+        # Buy rules: only buy in neutral or positive market regime.
+        if regime_score >= 45:
+            candidates = [
+                x for x in daily_scores
+                if x["score"] >= 64
+                and x["ticker"] not in positions
+                and x["volatility"] < 0.06
+            ]
 
-        for data in candidates[:max_positions]:
-            if len(positions) >= max_positions:
-                break
+            for data in candidates[:max_positions]:
+                if len(positions) >= max_positions:
+                    break
 
-            allocation = starting_cash * 0.20
-            spend = min(cash, allocation)
+                # Smaller allocation in weaker markets.
+                regime_multiplier = 1.0 if regime_score >= 60 else 0.60
+                spend = min(cash, starting_cash * max_position_fraction * regime_multiplier)
 
-            if spend < 100:
-                continue
+                if spend < 100:
+                    continue
 
-            shares = spend / data["price"]
-            cash -= spend
+                shares = spend / data["price"]
+                cash -= spend
 
-            positions[data["ticker"]] = {
-                "shares": shares,
-                "avg_price": data["price"],
-            }
+                positions[data["ticker"]] = {
+                    "shares": shares,
+                    "avg_price": data["price"],
+                    "highest_price": data["price"],
+                }
 
-            trades.append({
-                "Date": current_date.date(),
-                "Ticker": data["ticker"],
-                "Action": "BUY",
-                "Price": round(data["price"], 2),
-                "Shares": round(shares, 4),
-                "Value": round(spend, 2),
-                "Score": round(data["score"], 1),
-            })
+                trades.append({
+                    "Date": current_date.date(),
+                    "Ticker": data["ticker"],
+                    "Action": "BUY",
+                    "Price": round(data["price"], 2),
+                    "Shares": round(shares, 4),
+                    "Value": round(spend, 2),
+                    "Score": round(data["score"], 1),
+                    "Reason": "strong score with acceptable market regime",
+                })
 
         stock_value = 0
 
@@ -1436,10 +1553,27 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
             "Invested": round(stock_value, 2),
             "Return %": round((total_value / starting_cash - 1) * 100, 2),
             "Open Positions": len(positions),
+            "Market Regime Score": round(regime_score, 1),
+            "Market Notes": " ".join(regime_notes[:3]),
         })
 
     portfolio_df = pd.DataFrame(portfolio_history)
     trades_df = pd.DataFrame(trades)
+
+    benchmark_rows = []
+    for bench in ["SPY", "QQQ"]:
+        dfb = market_context.get(bench)
+        if dfb is not None and common_dates[0] in dfb.index and common_dates[-1] in dfb.index:
+            start_price = float(dfb.loc[common_dates[0]]["Close"])
+            end_price = float(dfb.loc[common_dates[-1]]["Close"])
+            final_value = starting_cash * (end_price / start_price)
+            benchmark_rows.append({
+                "Benchmark": bench,
+                "Final Value": round(final_value, 2),
+                "Return %": round((final_value / starting_cash - 1) * 100, 2),
+            })
+
+    benchmark_df = pd.DataFrame(benchmark_rows)
 
     if portfolio_df.empty:
         summary = {}
@@ -1448,6 +1582,7 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
         peak = float(portfolio_df["Portfolio Value"].max())
         low = float(portfolio_df["Portfolio Value"].min())
         total_return = (final_value / starting_cash - 1) * 100
+        max_drawdown = ((low / peak) - 1) * 100 if peak else 0
 
         summary = {
             "starting_cash": starting_cash,
@@ -1456,6 +1591,7 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
             "return_percent": round(total_return, 2),
             "peak_value": round(peak, 2),
             "lowest_value": round(low, 2),
+            "max_drawdown_percent": round(max_drawdown, 2),
             "number_of_trades": len(trades_df),
             "open_positions": int(portfolio_df["Open Positions"].iloc[-1]),
         }
@@ -1467,41 +1603,63 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
         temp["Daily Change"] = temp["Portfolio Value"].diff()
         temp["Daily Change %"] = temp["Portfolio Value"].pct_change() * 100
         major_moves = temp.dropna().copy()
-        major_moves = major_moves.reindex(major_moves["Daily Change %"].abs().sort_values(ascending=False).index).head(8)
+        major_moves = major_moves.reindex(major_moves["Daily Change %"].abs().sort_values(ascending=False).index).head(10)
 
         for _, row in major_moves.iterrows():
             change = float(row["Daily Change"])
             change_pct = float(row["Daily Change %"])
             day = row["Date"]
+            notes = row.get("Market Notes", "")
 
             same_day_trades = trades_df[trades_df["Date"].astype(str) == str(day)] if not trades_df.empty else pd.DataFrame()
 
+            context_parts = []
+
+            for symbol, label in {
+                "SPY": "S&P 500",
+                "QQQ": "Nasdaq 100",
+                "^VIX": "VIX",
+                "^TNX": "10Y yield",
+                "CL=F": "Oil",
+                "BTC-USD": "Bitcoin",
+            }.items():
+                ctx = market_context.get(symbol)
+                if ctx is not None:
+                    match_dates = [d for d in ctx.index if str(d.date()) == str(day)]
+                    if match_dates:
+                        d = match_dates[0]
+                        r1 = float(ctx.loc[d].get("return_1d") or 0) * 100
+                        if abs(r1) >= 1.0 or symbol in ["^VIX", "^TNX"]:
+                            context_parts.append(f"{label} moved {r1:.2f}%")
+
             if change > 0:
-                reason = "Portfolio increased mainly because held positions moved higher."
+                reason = "Portfolio gained as the algorithm's held stocks benefited from the day's market setup."
             else:
-                reason = "Portfolio decreased mainly because held positions moved lower or the algorithm reduced exposure."
+                reason = "Portfolio fell as the market setup turned weaker for the algorithm's held stocks."
+
+            if context_parts:
+                reason += " Market context: " + "; ".join(context_parts[:4]) + "."
+
+            if notes:
+                reason += " Regime notes: " + notes
 
             if not same_day_trades.empty:
                 bought = same_day_trades[same_day_trades["Action"] == "BUY"]["Ticker"].tolist()
                 sold = same_day_trades[same_day_trades["Action"] == "SELL"]["Ticker"].tolist()
 
-                trade_notes = []
                 if bought:
-                    trade_notes.append("bought " + ", ".join(bought[:5]))
+                    reason += " The algorithm added exposure to " + ", ".join(bought[:5]) + "."
                 if sold:
-                    trade_notes.append("sold " + ", ".join(sold[:5]))
+                    reason += " The algorithm reduced risk by selling " + ", ".join(sold[:5]) + "."
 
-                if trade_notes:
-                    reason += " The algorithm " + " and ".join(trade_notes) + "."
-
-            if abs(change_pct) > 4:
-                reason += " A move this large often happens during broad market volatility, earnings reactions, rate/inflation news, or sector-wide news."
+            reason += " This is market-data based reasoning, not a verified archived news headline."
 
             explanations.append({
                 "Date": day,
                 "Portfolio Change": round(change, 2),
                 "Portfolio Change %": round(change_pct, 2),
-                "Estimated Reason": reason,
+                "Market Regime Score": row.get("Market Regime Score"),
+                "Estimated Market Reason": reason,
             })
 
     explanations_df = pd.DataFrame(explanations)
@@ -1511,6 +1669,7 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
         "portfolio_history": portfolio_df,
         "trades": trades_df,
         "explanations": explanations_df,
+        "benchmark": benchmark_df,
     }
 
 
