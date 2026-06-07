@@ -2812,11 +2812,12 @@ def run_dashboard():
 
     st.divider()
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Market Dashboard",
         "Stock Deep Dive",
         "Algorithm Simulator",
         "News & Explanations",
+        "Risk & Allocation",
     ])
 
     with tab1:
@@ -3002,7 +3003,7 @@ def run_dashboard():
 
 
 
-    with tab7:
+    with tab5:
         st.subheader("Market Regime & Capital Allocation Engine")
         st.caption("This section decides how aggressive the algorithm should be based on market conditions, relative strength, and portfolio heat.")
 
