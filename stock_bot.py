@@ -1271,6 +1271,202 @@ class StockBot:
         return results
 
 
+
+# =========================
+# 35-DAY STRATEGY SIMULATOR
+# =========================
+
+def run_35_day_simulation(starting_cash: float = 10000, days: int = 35) -> Dict:
+    prices = {}
+    score_rows = []
+
+    for ticker, company in WATCHLIST.items():
+        try:
+            df = yf.download(ticker, period="90d", progress=False, auto_adjust=True)
+
+            if df.empty:
+                continue
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            df = df.tail(days + 20).copy()
+
+            df["return_1d"] = df["Close"].pct_change()
+            df["return_5d"] = df["Close"].pct_change(5)
+            df["return_20d"] = df["Close"].pct_change(20)
+            df["ma_20"] = df["Close"].rolling(20).mean()
+            df["ma_50"] = df["Close"].rolling(50).mean()
+            df["volume_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
+
+            prices[ticker] = df
+
+        except Exception:
+            continue
+
+    if not prices:
+        return {
+            "summary": {},
+            "portfolio_history": pd.DataFrame(),
+            "trades": pd.DataFrame(),
+        }
+
+    common_dates = sorted(set.intersection(*[set(df.index) for df in prices.values()]))
+    common_dates = common_dates[-days:]
+
+    cash = starting_cash
+    positions = {}
+    portfolio_history = []
+    trades = []
+
+    for current_date in common_dates:
+        daily_scores = []
+
+        for ticker, df in prices.items():
+            if current_date not in df.index:
+                continue
+
+            row = df.loc[current_date]
+
+            price = float(row["Close"])
+            r5 = float(row.get("return_5d") or 0)
+            r20 = float(row.get("return_20d") or 0)
+            volume_ratio = float(row.get("volume_ratio") or 1)
+            ma20 = float(row.get("ma_20") or 0)
+
+            momentum_score = 50
+            momentum_score += normalize_percent(r5, -0.10, 0.10) * 0.30 - 15
+            momentum_score += normalize_percent(r20, -0.20, 0.20) * 0.40 - 20
+
+            if ma20 and price > ma20:
+                momentum_score += 10
+            else:
+                momentum_score -= 5
+
+            volume_score = 50
+            if volume_ratio > 1.8 and r5 > 0:
+                volume_score = 75
+            elif volume_ratio > 1.8 and r5 < 0:
+                volume_score = 35
+            elif volume_ratio > 1.2:
+                volume_score = 60
+
+            simulated_score = clamp(momentum_score * 0.70 + volume_score * 0.30)
+
+            daily_scores.append({
+                "ticker": ticker,
+                "price": price,
+                "score": simulated_score,
+                "r5": r5,
+                "r20": r20,
+                "volume_ratio": volume_ratio,
+            })
+
+        daily_scores = sorted(daily_scores, key=lambda x: x["score"], reverse=True)
+
+        # Sell weak positions
+        for ticker in list(positions.keys()):
+            matching = [x for x in daily_scores if x["ticker"] == ticker]
+            if not matching:
+                continue
+
+            data = matching[0]
+
+            if data["score"] < 45:
+                shares = positions[ticker]["shares"]
+                proceeds = shares * data["price"]
+                cash += proceeds
+
+                trades.append({
+                    "Date": current_date.date(),
+                    "Ticker": ticker,
+                    "Action": "SELL",
+                    "Price": round(data["price"], 2),
+                    "Shares": round(shares, 4),
+                    "Value": round(proceeds, 2),
+                    "Score": round(data["score"], 1),
+                })
+
+                del positions[ticker]
+
+        # Buy top names with score above 62
+        candidates = [x for x in daily_scores if x["score"] >= 62 and x["ticker"] not in positions]
+        max_positions = 5
+
+        for data in candidates[:max_positions]:
+            if len(positions) >= max_positions:
+                break
+
+            allocation = starting_cash * 0.20
+            spend = min(cash, allocation)
+
+            if spend < 100:
+                continue
+
+            shares = spend / data["price"]
+            cash -= spend
+
+            positions[data["ticker"]] = {
+                "shares": shares,
+                "avg_price": data["price"],
+            }
+
+            trades.append({
+                "Date": current_date.date(),
+                "Ticker": data["ticker"],
+                "Action": "BUY",
+                "Price": round(data["price"], 2),
+                "Shares": round(shares, 4),
+                "Value": round(spend, 2),
+                "Score": round(data["score"], 1),
+            })
+
+        stock_value = 0
+
+        for ticker, pos in positions.items():
+            if ticker in prices and current_date in prices[ticker].index:
+                stock_value += pos["shares"] * float(prices[ticker].loc[current_date]["Close"])
+
+        total_value = cash + stock_value
+
+        portfolio_history.append({
+            "Date": current_date.date(),
+            "Portfolio Value": round(total_value, 2),
+            "Cash": round(cash, 2),
+            "Invested": round(stock_value, 2),
+            "Return %": round((total_value / starting_cash - 1) * 100, 2),
+            "Open Positions": len(positions),
+        })
+
+    portfolio_df = pd.DataFrame(portfolio_history)
+    trades_df = pd.DataFrame(trades)
+
+    if portfolio_df.empty:
+        summary = {}
+    else:
+        final_value = float(portfolio_df["Portfolio Value"].iloc[-1])
+        peak = float(portfolio_df["Portfolio Value"].max())
+        low = float(portfolio_df["Portfolio Value"].min())
+        total_return = (final_value / starting_cash - 1) * 100
+
+        summary = {
+            "starting_cash": starting_cash,
+            "final_value": round(final_value, 2),
+            "profit_loss": round(final_value - starting_cash, 2),
+            "return_percent": round(total_return, 2),
+            "peak_value": round(peak, 2),
+            "lowest_value": round(low, 2),
+            "number_of_trades": len(trades_df),
+            "open_positions": int(portfolio_df["Open Positions"].iloc[-1]),
+        }
+
+    return {
+        "summary": summary,
+        "portfolio_history": portfolio_df,
+        "trades": trades_df,
+    }
+
+
 # =========================
 # DASHBOARD
 # =========================
@@ -1279,45 +1475,51 @@ def run_dashboard():
     import streamlit as st
 
     st.set_page_config(
-        page_title="Ethan Yen AI Stock Signal Bot",
+        page_title="Ethan Yen AI Market Terminal",
         layout="wide",
         initial_sidebar_state="expanded",
     )
 
     st.markdown("""
     <style>
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+        max-width: 1500px;
+    }
     .main-title {
-        font-size: 44px;
+        font-size: 40px;
         font-weight: 900;
+        letter-spacing: -1.2px;
         margin-bottom: 0px;
-        letter-spacing: -1px;
     }
     .subtitle {
-        font-size: 17px;
-        color: #8a8a8a;
-        margin-bottom: 24px;
+        font-size: 15px;
+        color: #9ca3af;
+        margin-bottom: 22px;
     }
-    .metric-card {
-        padding: 18px;
-        border-radius: 18px;
-        border: 1px solid rgba(128,128,128,0.25);
-        background: rgba(128,128,128,0.08);
+    div[data-testid="metric-container"] {
+        background-color: rgba(125, 125, 125, 0.08);
+        border: 1px solid rgba(125, 125, 125, 0.18);
+        padding: 14px 16px;
+        border-radius: 14px;
     }
-    .buy-text { color: #12b886; font-weight: 900; }
-    .hold-text { color: #fab005; font-weight: 900; }
-    .sell-text { color: #fa5252; font-weight: 900; }
+    div[data-testid="stDataFrame"] {
+        border-radius: 14px;
+        overflow: hidden;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-    st.markdown('<div class="main-title">Ethan Yen AI Stock Signal Bot</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">Live prices, AI news scoring, trends, momentum, volume, charts, and paper-trading signals</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title">Ethan Yen AI Market Terminal</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">Live prices, AI scores, market momentum, news sentiment, charts, and 35-day paper-trading simulator</div>', unsafe_allow_html=True)
 
     db = Database()
     trader = PaperTrader(db)
 
     st.sidebar.title("Controls")
     auto_refresh = st.sidebar.checkbox("Auto-load data if empty", value=True)
-    selected_period = st.sidebar.selectbox("Chart period", ["1mo", "3mo", "6mo", "1y", "2y"], index=2)
+    selected_period = st.sidebar.selectbox("Chart period", ["1mo", "3mo", "6mo", "1y", "2y"], index=1)
     selected_chart_type = st.sidebar.selectbox("Chart type", ["Close price", "Volume", "Close + moving averages"], index=0)
 
     if st.sidebar.button("Refresh All Data"):
@@ -1345,26 +1547,17 @@ def run_dashboard():
         market = db.latest_market_row(ticker)
 
         if score and market:
-            price = float(market.get("close") or 0)
-            r1 = float(market.get("return_1d") or 0) * 100
-            r5 = float(market.get("return_5d") or 0) * 100
-            r20 = float(market.get("return_20d") or 0) * 100
-            volume = float(market.get("volume") or 0)
-            volume_ratio = float(market.get("volume_ratio") or 0)
-            ma20 = float(market.get("ma_20") or 0)
-            rsi = float(market.get("rsi") or 0)
-
             rows.append({
                 "Ticker": ticker,
                 "Company": company,
-                "Price": price,
-                "1D %": r1,
-                "5D %": r5,
-                "20D %": r20,
-                "Volume": volume,
-                "Volume Ratio": volume_ratio,
-                "20D MA": ma20,
-                "RSI": rsi,
+                "Price": float(market.get("close") or 0),
+                "1D %": float(market.get("return_1d") or 0) * 100,
+                "5D %": float(market.get("return_5d") or 0) * 100,
+                "20D %": float(market.get("return_20d") or 0) * 100,
+                "Volume": float(market.get("volume") or 0),
+                "Vol Ratio": float(market.get("volume_ratio") or 0),
+                "20D MA": float(market.get("ma_20") or 0),
+                "RSI": float(market.get("rsi") or 0),
                 "Score": float(score.get("final_score") or 0),
                 "Signal": score.get("signal"),
                 "News": float(score.get("news_score") or 0),
@@ -1380,151 +1573,189 @@ def run_dashboard():
 
     df = pd.DataFrame(rows).sort_values("Score", ascending=False)
 
-    total_stocks = len(df)
     buy_count = int((df["Signal"] == "BUY").sum())
     watch_count = int((df["Signal"] == "WATCH").sum())
     sell_count = int(df["Signal"].isin(["SELL", "EMERGENCY_SELL"]).sum())
     avg_score = float(df["Score"].mean())
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Paper Portfolio", f"${trader.portfolio_value():,.2f}")
-    m2.metric("Cash", f"${db.get_cash():,.2f}")
-    m3.metric("Stocks Tracked", total_stocks)
-    m4.metric("Average Score", f"{avg_score:.1f}")
-    m5.metric("Buy Signals", buy_count)
-    m6.metric("Sell Signals", sell_count)
-
-    st.divider()
-
     top = df.iloc[0]
     bottom = df.iloc[-1]
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Top Ranked", f"{top['Ticker']}", f"Score {top['Score']:.1f}")
-    c2.metric("Weakest Ranked", f"{bottom['Ticker']}", f"Score {bottom['Score']:.1f}")
-    c3.metric("Watch Signals", watch_count)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Portfolio", f"${trader.portfolio_value():,.2f}")
+    m2.metric("Cash", f"${db.get_cash():,.2f}")
+    m3.metric("Stocks", len(df))
+    m4.metric("Avg Score", f"{avg_score:.1f}")
+    m5.metric("Top", f"{top['Ticker']}", f"{top['Score']:.1f}")
+    m6.metric("Weakest", f"{bottom['Ticker']}", f"{bottom['Score']:.1f}")
 
-    st.subheader("Market Signal Table")
+    st.divider()
 
-    def signal_badge(signal):
-        if signal == "BUY":
-            return "🟢 BUY"
-        if signal == "WATCH":
-            return "🔵 WATCH"
-        if signal == "HOLD":
-            return "🟡 HOLD"
-        if signal in ["SELL", "EMERGENCY_SELL"]:
-            return "🔴 SELL"
-        return signal
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Market Dashboard",
+        "Stock Deep Dive",
+        "35-Day Simulator",
+        "News & Explanations",
+    ])
 
-    display_df = df.copy()
-    display_df["Signal"] = display_df["Signal"].apply(signal_badge)
-    display_df["Price"] = display_df["Price"].map(lambda x: f"${x:,.2f}")
-    display_df["1D %"] = display_df["1D %"].map(lambda x: f"{x:.2f}%")
-    display_df["5D %"] = display_df["5D %"].map(lambda x: f"{x:.2f}%")
-    display_df["20D %"] = display_df["20D %"].map(lambda x: f"{x:.2f}%")
-    display_df["Volume"] = display_df["Volume"].map(lambda x: f"{x:,.0f}")
-    display_df["Volume Ratio"] = display_df["Volume Ratio"].map(lambda x: f"{x:.2f}x")
-    display_df["20D MA"] = display_df["20D MA"].map(lambda x: f"${x:,.2f}")
-    display_df["RSI"] = display_df["RSI"].map(lambda x: f"{x:.1f}")
-    display_df["Score"] = display_df["Score"].map(lambda x: f"{x:.1f}")
+    with tab1:
+        st.subheader("Market Signal Table")
 
-    st.dataframe(display_df, width="stretch", hide_index=True)
+        display_df = df.copy()
+        display_df["Signal"] = display_df["Signal"].map({
+            "BUY": "🟢 BUY",
+            "WATCH": "🔵 WATCH",
+            "HOLD": "🟡 HOLD",
+            "SELL": "🔴 SELL",
+            "EMERGENCY_SELL": "🔴 EMERGENCY SELL",
+        }).fillna(display_df["Signal"])
 
-    st.subheader("Score Ranking Graph")
-    chart_df = df[["Ticker", "Score"]].set_index("Ticker")
-    st.bar_chart(chart_df, width="stretch")
+        st.dataframe(
+            display_df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Price": st.column_config.NumberColumn("Price", format="$%.2f"),
+                "1D %": st.column_config.NumberColumn("1D %", format="%.2f%%"),
+                "5D %": st.column_config.NumberColumn("5D %", format="%.2f%%"),
+                "20D %": st.column_config.NumberColumn("20D %", format="%.2f%%"),
+                "Volume": st.column_config.NumberColumn("Volume", format="compact"),
+                "Vol Ratio": st.column_config.NumberColumn("Vol Ratio", format="%.2fx"),
+                "20D MA": st.column_config.NumberColumn("20D MA", format="$%.2f"),
+                "RSI": st.column_config.NumberColumn("RSI", format="%.1f"),
+                "Score": st.column_config.ProgressColumn("AI Score", min_value=0, max_value=100, format="%.1f"),
+            },
+        )
 
-    st.subheader("Price Movement Comparison")
-    movement_df = df[["Ticker", "1D %", "5D %", "20D %"]].set_index("Ticker")
-    st.line_chart(movement_df, width="stretch")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            st.subheader("AI Score Ranking")
+            st.bar_chart(df.set_index("Ticker")["Score"], width="stretch")
 
-    st.subheader("Stock Deep Dive")
+        with c2:
+            st.subheader("Price Movement")
+            st.line_chart(df.set_index("Ticker")[["1D %", "5D %", "20D %"]], width="stretch")
 
-    selected = st.selectbox(
-        "Choose a stock to inspect",
-        df["Ticker"].tolist(),
-        index=0,
-    )
+    with tab2:
+        selected = st.selectbox("Choose a stock to inspect", df["Ticker"].tolist(), index=0)
 
-    selected_company = WATCHLIST[selected]
-    selected_score = db.latest_score(selected)
-    selected_market = db.latest_market_row(selected)
+        selected_score = db.latest_score(selected)
+        selected_market = db.latest_market_row(selected)
 
-    if selected_market and selected_score:
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("Price", f"${float(selected_market.get('close') or 0):,.2f}")
-        p2.metric("1D", f"{float(selected_market.get('return_1d') or 0) * 100:.2f}%")
-        p3.metric("5D", f"{float(selected_market.get('return_5d') or 0) * 100:.2f}%")
-        p4.metric("20D", f"{float(selected_market.get('return_20d') or 0) * 100:.2f}%")
-        p5.metric("AI Score", f"{float(selected_score.get('final_score') or 0):.1f}")
+        if selected_market and selected_score:
+            p1, p2, p3, p4, p5 = st.columns(5)
+            p1.metric("Price", f"${float(selected_market.get('close') or 0):,.2f}")
+            p2.metric("1D", f"{float(selected_market.get('return_1d') or 0) * 100:.2f}%")
+            p3.metric("5D", f"{float(selected_market.get('return_5d') or 0) * 100:.2f}%")
+            p4.metric("20D", f"{float(selected_market.get('return_20d') or 0) * 100:.2f}%")
+            p5.metric("AI Score", f"{float(selected_score.get('final_score') or 0):.1f}")
 
-    chart_data = yf.download(selected, period=selected_period, progress=False, auto_adjust=True)
+        chart_data = yf.download(selected, period=selected_period, progress=False, auto_adjust=True)
 
-    if not chart_data.empty:
-        if selected_chart_type == "Close price":
-            st.line_chart(chart_data["Close"], width="stretch")
-        elif selected_chart_type == "Volume":
-            st.bar_chart(chart_data["Volume"], width="stretch")
-        else:
-            chart_data["MA20"] = chart_data["Close"].rolling(20).mean()
-            chart_data["MA50"] = chart_data["Close"].rolling(50).mean()
-            st.line_chart(chart_data[["Close", "MA20", "MA50"]], width="stretch")
+        if not chart_data.empty:
+            if isinstance(chart_data.columns, pd.MultiIndex):
+                chart_data.columns = chart_data.columns.get_level_values(0)
 
-    st.subheader("Score Breakdown")
-
-    if selected_score:
-        breakdown = pd.DataFrame({
-            "Component": ["News", "Trend", "Momentum", "Volume", "Macro Risk", "Earnings Risk", "Confidence"],
-            "Score": [
-                selected_score.get("news_score"),
-                selected_score.get("trend_score"),
-                selected_score.get("momentum_score"),
-                selected_score.get("volume_score"),
-                selected_score.get("macro_risk_score"),
-                selected_score.get("earnings_risk_score"),
-                selected_score.get("confidence_score"),
-            ],
-        }).set_index("Component")
-
-        st.bar_chart(breakdown, width="stretch")
-
-        st.write("Reasons:")
-        for reason in selected_score.get("reasons", []):
-            st.write(f"- {reason}")
-
-    st.subheader("Recent Filtered Headlines")
-
-    news = db.recent_news(selected)
-
-    if news:
-        for item in news[:10]:
-            title = item.get("title")
-            url = item.get("url")
-            source = item.get("source")
-            sentiment = item.get("sentiment")
-
-            if url:
-                st.markdown(f"**[{title}]({url})**")
+            if selected_chart_type == "Close price":
+                st.line_chart(chart_data["Close"], width="stretch")
+            elif selected_chart_type == "Volume":
+                st.bar_chart(chart_data["Volume"], width="stretch")
             else:
-                st.markdown(f"**{title}**")
+                chart_data["MA20"] = chart_data["Close"].rolling(20).mean()
+                chart_data["MA50"] = chart_data["Close"].rolling(50).mean()
+                st.line_chart(chart_data[["Close", "MA20", "MA50"]], width="stretch")
 
-            st.caption(f"Source: {source} | Sentiment: {sentiment}")
-    else:
-        st.info("No recent filtered headlines for this stock.")
+        st.subheader("Score Breakdown")
 
-    st.subheader("All Signal Explanations")
+        if selected_score:
+            breakdown = pd.DataFrame({
+                "Component": ["News", "Trend", "Momentum", "Volume", "Macro Risk", "Earnings Risk", "Confidence"],
+                "Score": [
+                    selected_score.get("news_score"),
+                    selected_score.get("trend_score"),
+                    selected_score.get("momentum_score"),
+                    selected_score.get("volume_score"),
+                    selected_score.get("macro_risk_score"),
+                    selected_score.get("earnings_risk_score"),
+                    selected_score.get("confidence_score"),
+                ],
+            }).set_index("Component")
 
-    for ticker in df["Ticker"]:
-        score = db.latest_score(ticker)
-        market = db.latest_market_row(ticker)
+            st.bar_chart(breakdown, width="stretch")
 
-        if not score or not market:
-            continue
+    with tab3:
+        st.subheader("35-Day Paper Trading Simulator")
+        st.caption("This is a simplified historical simulator using price momentum and volume rules. It does not recreate historical news sentiment, so treat it as a strategy test, not proof of future performance.")
 
-        with st.expander(f"{ticker} | ${float(market.get('close') or 0):,.2f} | Score {float(score.get('final_score') or 0):.1f} | {score.get('signal')}"):
-            for reason in score.get("reasons", []):
-                st.write(f"- {reason}")
+        sim_cash = st.number_input("Starting cash", min_value=1000, max_value=1000000, value=10000, step=1000)
+        sim_days = st.slider("Simulation period", min_value=10, max_value=60, value=35)
+
+        if st.button("Run 35-Day Simulation"):
+            with st.spinner("Running historical paper-trading simulation..."):
+                result = run_35_day_simulation(starting_cash=sim_cash, days=sim_days)
+
+            summary = result["summary"]
+            history = result["portfolio_history"]
+            trades = result["trades"]
+
+            if not summary or history.empty:
+                st.error("Simulation failed because price data was unavailable.")
+            else:
+                s1, s2, s3, s4, s5 = st.columns(5)
+                s1.metric("Start", f"${summary['starting_cash']:,.2f}")
+                s2.metric("Final Value", f"${summary['final_value']:,.2f}")
+                s3.metric("Profit / Loss", f"${summary['profit_loss']:,.2f}", f"{summary['return_percent']:.2f}%")
+                s4.metric("Peak Value", f"${summary['peak_value']:,.2f}")
+                s5.metric("Trades", summary["number_of_trades"])
+
+                st.subheader("Portfolio Value Trend")
+                st.line_chart(history.set_index("Date")[["Portfolio Value", "Cash", "Invested"]], width="stretch")
+
+                st.subheader("Portfolio Return %")
+                st.line_chart(history.set_index("Date")["Return %"], width="stretch")
+
+                st.subheader("Daily Portfolio History")
+                st.dataframe(history, width="stretch", hide_index=True)
+
+                st.subheader("Simulated Trades")
+                if trades.empty:
+                    st.info("No trades were triggered during the simulation.")
+                else:
+                    st.dataframe(trades, width="stretch", hide_index=True)
+
+    with tab4:
+        st.subheader("Recent Filtered Headlines")
+        selected_news_ticker = st.selectbox("Choose stock for news", df["Ticker"].tolist(), key="news_select")
+        news = db.recent_news(selected_news_ticker)
+
+        if news:
+            for item in news[:10]:
+                title = item.get("title")
+                url = item.get("url")
+                source = item.get("source")
+                sentiment = item.get("sentiment")
+
+                if url:
+                    st.markdown(f"**[{title}]({url})**")
+                else:
+                    st.markdown(f"**{title}**")
+
+                st.caption(f"Source: {source} | Sentiment: {sentiment}")
+        else:
+            st.info("No recent filtered headlines for this stock.")
+
+        st.subheader("All Signal Explanations")
+
+        for ticker in df["Ticker"]:
+            score = db.latest_score(ticker)
+            market = db.latest_market_row(ticker)
+
+            if not score or not market:
+                continue
+
+            with st.expander(f"{ticker} | ${float(market.get('close') or 0):,.2f} | Score {float(score.get('final_score') or 0):.1f} | {score.get('signal')}"):
+                for reason in score.get("reasons", []):
+                    st.write(f"- {reason}")
 
 
 # =========================
