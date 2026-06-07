@@ -100,6 +100,28 @@ MARKET_TERMS = [
     "ai", "chip", "cloud", "sales", "quarter", "growth"
 ]
 
+MACRO_RSS_FEEDS = {
+    "Federal Reserve": "https://www.federalreserve.gov/feeds/press_all.xml",
+    "SEC": "https://www.sec.gov/news/pressreleases.rss",
+    "Treasury": "https://home.treasury.gov/news/press-releases/feed",
+    "White House": "https://www.whitehouse.gov/feed/",
+    "BLS": "https://www.bls.gov/feed/news_release.rss",
+    "BEA": "https://www.bea.gov/news/current-releases/rss.xml",
+}
+
+MACRO_POSITIVE_TERMS = [
+    "rate cut", "cuts rates", "cooling inflation", "inflation eased",
+    "strong jobs", "gdp growth", "soft landing", "lower yields",
+    "consumer confidence rises", "productivity rises"
+]
+
+MACRO_NEGATIVE_TERMS = [
+    "rate hike", "higher rates", "inflation rose", "hot inflation",
+    "recession", "unemployment rises", "jobless claims rise",
+    "bank stress", "default", "shutdown", "tariff", "sanctions",
+    "geopolitical risk", "war", "oil spike"
+]
+
 
 # =========================
 # DATABASE
@@ -144,6 +166,19 @@ class Database:
             published_at TEXT,
             sentiment REAL,
             surprise_type TEXT,
+            created_at TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS macro_news (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            source TEXT,
+            url TEXT UNIQUE,
+            published_at TEXT,
+            sentiment REAL,
+            impact_score REAL,
             created_at TEXT
         )
         """)
@@ -250,6 +285,43 @@ class Database:
             self.conn.commit()
         except Exception:
             pass
+
+    def save_macro_news(self, item: Dict):
+        cur = self.conn.cursor()
+
+        try:
+            cur.execute("""
+            INSERT OR IGNORE INTO macro_news
+            (title, source, url, published_at, sentiment, impact_score, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                item["title"],
+                item["source"],
+                item["url"],
+                item["published_at"],
+                item.get("sentiment"),
+                item.get("impact_score"),
+                now_date(),
+            ))
+            self.conn.commit()
+        except Exception:
+            pass
+
+    def recent_macro_news(self, days: int = 5) -> List[Dict]:
+        cur = self.conn.cursor()
+        cutoff = dt.datetime.now() - dt.timedelta(days=days)
+
+        cur.execute("""
+        SELECT title, source, url, published_at, sentiment, impact_score
+        FROM macro_news
+        WHERE published_at >= ?
+        ORDER BY published_at DESC
+        LIMIT 50
+        """, (cutoff.isoformat(),))
+
+        rows = cur.fetchall()
+        cols = [x[0] for x in cur.description]
+        return [dict(zip(cols, row)) for row in rows]
 
     def save_score(self, score: Dict):
         cur = self.conn.cursor()
@@ -489,6 +561,78 @@ class MarketDataCollector:
         rsi = 100 - (100 / (1 + rs))
 
         return rsi
+
+
+# =========================
+# MACRO / GOVERNMENT NEWS
+# =========================
+
+class MacroNewsCollector:
+    def __init__(self, db: Database):
+        self.db = db
+        self.sentiment = SentimentEngine()
+
+    def fetch_all(self) -> List[Dict]:
+        all_items = []
+
+        for source, url in MACRO_RSS_FEEDS.items():
+            all_items.extend(self.fetch_rss(source, url))
+
+        saved_items = []
+
+        for item in all_items:
+            title = item.get("title", "")
+            item["sentiment"] = self.sentiment.score(title)
+            item["impact_score"] = self.score_macro_impact(title)
+            self.db.save_macro_news(item)
+            saved_items.append(item)
+
+        return saved_items
+
+    def fetch_rss(self, source: str, url: str) -> List[Dict]:
+        try:
+            response = requests.get(
+                url,
+                timeout=10,
+                headers={"User-Agent": "EthanYenStockBot/1.0"}
+            )
+            text = response.text
+        except Exception:
+            return []
+
+        items = []
+        parts = text.split("<item>")[1:30]
+
+        for part in parts:
+            title = clean_html(extract_between(part, "<title>", "</title>"))
+            link = extract_between(part, "<link>", "</link>")
+            pub_date = extract_between(part, "<pubDate>", "</pubDate>")
+
+            if not title:
+                continue
+
+            items.append({
+                "title": title,
+                "source": source,
+                "url": link or f"macro:{source}:{hash(title)}",
+                "published_at": parse_rss_date(pub_date),
+            })
+
+        return items
+
+    def score_macro_impact(self, title: str) -> float:
+        t = title.lower()
+        score = 50
+
+        for term in MACRO_POSITIVE_TERMS:
+            if term in t:
+                score += 12
+
+        for term in MACRO_NEGATIVE_TERMS:
+            if term in t:
+                score -= 14
+
+        return clamp(score)
 
 
 # =========================
@@ -941,26 +1085,34 @@ class StockScorer:
         return 50
 
     def calculate_macro_risk_score(self, news: List[Dict]) -> float:
-        if not news:
-            return 50
+        macro_news = self.db.recent_macro_news(days=7)
 
         risk_terms = [
             "inflation", "rate hike", "higher rates", "recession",
             "tariff", "war", "regulation", "lawsuit", "probe",
-            "federal reserve", "cpi", "unemployment"
+            "federal reserve", "cpi", "unemployment", "shutdown",
+            "sanctions", "oil", "treasury yield"
         ]
 
-        joined = " ".join([x.get("title", "").lower() for x in news])
+        company_titles = " ".join([x.get("title", "").lower() for x in news])
+        macro_titles = " ".join([x.get("title", "").lower() for x in macro_news])
+
+        joined = company_titles + " " + macro_titles
         risk_hits = sum(1 for term in risk_terms if term in joined)
 
-        if risk_hits >= 5:
-            return 20
-        if risk_hits >= 3:
-            return 35
-        if risk_hits >= 1:
-            return 45
+        if macro_news:
+            macro_score = float(np.mean([x.get("impact_score") or 50 for x in macro_news]))
+        else:
+            macro_score = 50
 
-        return 65
+        if risk_hits >= 6:
+            macro_score -= 20
+        elif risk_hits >= 3:
+            macro_score -= 10
+        elif risk_hits >= 1:
+            macro_score -= 5
+
+        return clamp(macro_score)
 
     def calculate_earnings_risk_score(self, news: List[Dict]) -> float:
         if not news:
@@ -1234,11 +1386,18 @@ class StockBot:
         self.db = Database()
         self.market = MarketDataCollector(self.db)
         self.news = NewsCollector(self.db)
+        self.macro = MacroNewsCollector(self.db)
         self.scorer = StockScorer(self.db)
         self.trader = PaperTrader(self.db)
 
     def run_daily_update(self):
         results = []
+
+        try:
+            macro_items = self.macro.fetch_all()
+            print(f"Macro/government news items found: {len(macro_items)}")
+        except Exception as e:
+            print(f"Macro news failed: {e}")
 
         for ticker, company in WATCHLIST.items():
             print(f"\nUpdating {ticker} - {company}")
@@ -1939,7 +2098,16 @@ def run_dashboard():
                     st.dataframe(trades, width="stretch", hide_index=True)
 
     with tab4:
-        st.subheader("Recent Filtered Headlines")
+        st.subheader("Official Macro / Government News")
+        macro_news = db.recent_macro_news(days=7)
+
+        if macro_news:
+            macro_df = pd.DataFrame(macro_news)
+            st.dataframe(macro_df[["source", "title", "impact_score", "sentiment", "published_at"]], width="stretch", hide_index=True)
+        else:
+            st.info("No recent macro/government news saved yet. Click Refresh All Data.")
+
+        st.subheader("Recent Filtered Company Headlines")
         selected_news_ticker = st.selectbox("Choose stock for news", df["Ticker"].tolist(), key="news_select")
         news = db.recent_news(selected_news_ticker)
 
