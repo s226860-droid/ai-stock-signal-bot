@@ -1810,13 +1810,15 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
 
             sell_reason = None
 
-            if data["score"] < 45:
+            if data["score"] < 48:
                 sell_reason = "algorithm score dropped below risk threshold"
             elif current_return <= stop_loss:
-                sell_reason = "stop loss triggered"
+                sell_reason = "stop loss triggered to protect capital"
             elif drawdown_from_high <= trailing_stop:
-                sell_reason = "trailing stop triggered"
-            elif regime_score < 35 and data["score"] < 55:
+                sell_reason = "trailing stop triggered to lock gains or limit downside"
+            elif current_return >= 0.18:
+                sell_reason = "take-profit rule triggered after strong gain"
+            elif regime_score < 40 and data["score"] < 58:
                 sell_reason = "market regime turned defensive"
 
             if sell_reason:
@@ -1838,12 +1840,14 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
                 del positions[ticker]
 
         # Buy rules: only buy in neutral or positive market regime.
-        if regime_score >= 45:
+        if regime_score >= 50:
             candidates = [
                 x for x in daily_scores
-                if x["score"] >= 64
+                if x["score"] >= 68
                 and x["ticker"] not in positions
-                and x["volatility"] < 0.06
+                and x["volatility"] < 0.05
+                and x["r5"] > -0.04
+                and x["r20"] > -0.08
             ]
 
             for data in candidates[:max_positions]:
@@ -1851,7 +1855,7 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
                     break
 
                 # Smaller allocation in weaker markets.
-                regime_multiplier = 1.0 if regime_score >= 60 else 0.60
+                regime_multiplier = 1.0 if regime_score >= 65 else 0.50
                 spend = min(cash, starting_cash * max_position_fraction * regime_multiplier)
 
                 if spend < 100:
@@ -2012,6 +2016,107 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
     }
 
 
+
+
+# =========================
+# RISK-FIRST ALGORITHM HELPERS
+# =========================
+
+def calculate_risk_adjusted_score(score: Dict, market: Dict) -> float:
+    base = float(score.get("final_score") or 50)
+    momentum = float(score.get("momentum_score") or 50)
+    macro = float(score.get("macro_risk_score") or 50)
+    volume_score = float(score.get("volume_score") or 50)
+
+    r1 = float(market.get("return_1d") or 0)
+    r5 = float(market.get("return_5d") or 0)
+    r20 = float(market.get("return_20d") or 0)
+    close = float(market.get("close") or 0)
+    ma20 = float(market.get("ma_20") or 0)
+    ma50 = float(market.get("ma_50") or 0)
+    rsi = float(market.get("rsi") or 50)
+    vol_ratio = float(market.get("volume_ratio") or 1)
+
+    adjusted = base
+
+    # Reward healthy momentum, not chaotic spikes.
+    if close and ma20 and close > ma20:
+        adjusted += 4
+    else:
+        adjusted -= 8
+
+    if close and ma50 and close > ma50:
+        adjusted += 6
+    else:
+        adjusted -= 10
+
+    # Avoid catching falling knives.
+    if r5 < -0.06:
+        adjusted -= 12
+    elif r5 < -0.03:
+        adjusted -= 6
+
+    if r20 < -0.12:
+        adjusted -= 15
+    elif r20 < -0.07:
+        adjusted -= 8
+
+    # Avoid extreme overbought entries.
+    if rsi > 80:
+        adjusted -= 12
+    elif rsi > 75:
+        adjusted -= 8
+    elif 45 <= rsi <= 65:
+        adjusted += 4
+
+    # Volume confirmation.
+    if vol_ratio > 1.5 and r1 > 0:
+        adjusted += 5
+    elif vol_ratio > 1.5 and r1 < 0:
+        adjusted -= 8
+
+    # Macro filter.
+    if macro < 40:
+        adjusted -= 10
+    elif macro > 60:
+        adjusted += 4
+
+    return round(clamp(adjusted), 2)
+
+def calculate_trade_plan(score: Dict, market: Dict) -> Dict:
+    price = float(market.get("close") or 0)
+    risk_adj = calculate_risk_adjusted_score(score, market)
+    rsi = float(market.get("rsi") or 50)
+    r20 = float(market.get("return_20d") or 0)
+
+    if risk_adj >= 75:
+        action = "BUY"
+    elif risk_adj >= 65:
+        action = "WATCH"
+    elif risk_adj <= 42:
+        action = "SELL / AVOID"
+    else:
+        action = "HOLD"
+
+    stop_loss = price * 0.92 if price else 0
+    trailing_stop = "10%"
+    take_profit_1 = price * 1.10 if price else 0
+    take_profit_2 = price * 1.18 if price else 0
+
+    if rsi > 75:
+        action = "WAIT - OVEREXTENDED"
+
+    if r20 < -0.12:
+        action = "AVOID - DOWNTREND"
+
+    return {
+        "Risk Adjusted Score": risk_adj,
+        "Plan": action,
+        "Stop Loss": round(stop_loss, 2),
+        "Trailing Stop": trailing_stop,
+        "Take Profit 1": round(take_profit_1, 2),
+        "Take Profit 2": round(take_profit_2, 2),
+    }
 
 # =========================
 # PROFESSIONAL ANALYTICS
@@ -2192,6 +2297,7 @@ def build_professional_table(db: Database, watchlist: Dict) -> pd.DataFrame:
         risk = get_risk_rating(market)
         confidence = get_confidence_rating(score, market)
         allocation = suggested_allocation(score, risk)
+        trade_plan = calculate_trade_plan(score, market)
 
         rows.append({
             "Ticker": ticker,
@@ -2199,6 +2305,11 @@ def build_professional_table(db: Database, watchlist: Dict) -> pd.DataFrame:
             "Sector": SECTOR_MAP.get(ticker, "Other"),
             "Price": float(market.get("close") or 0),
             "Score": float(score.get("final_score") or 0),
+            "Risk Adjusted Score": trade_plan["Risk Adjusted Score"],
+            "Trade Plan": trade_plan["Plan"],
+            "Stop Loss": trade_plan["Stop Loss"],
+            "Take Profit 1": trade_plan["Take Profit 1"],
+            "Take Profit 2": trade_plan["Take Profit 2"],
             "Signal": score.get("signal"),
             "Confidence": confidence,
             "Risk": risk,
