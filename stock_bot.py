@@ -1565,7 +1565,7 @@ def run_dashboard():
     trader = PaperTrader(db)
 
     st.sidebar.title("Dashboard Controls")
-st.sidebar.caption("Use refresh when you want the newest prices, news, and AI scores.")
+    st.sidebar.caption("Use refresh when you want the newest prices, news, and AI scores.")
     auto_refresh = True
     selected_period = st.sidebar.selectbox("Chart period", ["1mo", "3mo", "6mo", "1y", "2y"], index=1)
     selected_chart_type = st.sidebar.selectbox("Chart type", ["Close price", "Volume", "Close + moving averages"], index=0)
