@@ -51,13 +51,27 @@ WATCHLIST = {
     "NVDA": "Nvidia",
     "AMD": "AMD",
     "TSLA": "Tesla",
-    "META": "Meta",
-    "GOOGL": "Google",
+    "META": "Meta Platforms",
+    "GOOGL": "Alphabet Google",
     "AMZN": "Amazon",
     "PLTR": "Palantir",
     "COIN": "Coinbase",
-    "JPM": "JPMorgan",
+    "JPM": "JPMorgan Chase",
     "XOM": "Exxon Mobil",
+    "AVGO": "Broadcom",
+    "NFLX": "Netflix",
+    "CRM": "Salesforce",
+    "ORCL": "Oracle",
+    "ADBE": "Adobe",
+    "UBER": "Uber",
+    "SHOP": "Shopify",
+    "LLY": "Eli Lilly",
+    "UNH": "UnitedHealth",
+    "V": "Visa",
+    "MA": "Mastercard",
+    "COST": "Costco",
+    "WMT": "Walmart",
+    "HD": "Home Depot",
     "SPY": "S&P 500 ETF",
     "QQQ": "Nasdaq 100 ETF",
 }
@@ -72,6 +86,19 @@ MAX_POSITION_SIZE = 0.10
 
 ENABLE_REAL_TRADING = False
 ALLOW_EARNINGS_TRADES = False
+
+NEWS_NOISE_TERMS = [
+    "mlb", "nba", "nfl", "nhl", "soccer", "baseball", "football",
+    "basketball", "cricket", "ufc", "wwe", "celebrity", "movie",
+    "music", "album", "concert", "lyrics", "recipe", "horoscope"
+]
+
+MARKET_TERMS = [
+    "stock", "shares", "earnings", "revenue", "profit", "forecast",
+    "guidance", "analyst", "upgrade", "downgrade", "price target",
+    "market", "nasdaq", "nyse", "investor", "dividend", "valuation",
+    "ai", "chip", "cloud", "sales", "quarter", "growth"
+]
 
 
 # =========================
@@ -478,12 +505,18 @@ class NewsCollector:
 
         articles.extend(self.fetch_rss_fallback(ticker, company_name))
 
+        filtered_articles = []
+
         for article in articles:
+            if not is_relevant_stock_news(article, ticker, company_name):
+                continue
+
             article["sentiment"] = self.sentiment.score(article["title"])
             article["surprise_type"] = detect_surprise_type(article["title"])
             self.db.save_news(article)
+            filtered_articles.append(article)
 
-        return articles
+        return filtered_articles
 
     def fetch_newsapi(self, ticker: str, company_name: str) -> List[Dict]:
         query = f'"{company_name}" OR "{ticker}" stock earnings revenue guidance'
@@ -549,7 +582,7 @@ class NewsCollector:
         return articles
 
     def fetch_rss_fallback(self, ticker: str, company_name: str) -> List[Dict]:
-        query = f"{company_name}+{ticker}+stock"
+        query = f'"{company_name}"+{ticker}+stock+earnings+shares' 
         url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
 
         try:
@@ -577,6 +610,20 @@ class NewsCollector:
 
         return articles
 
+
+
+def is_relevant_stock_news(article: Dict, ticker: str, company_name: str) -> bool:
+    title = (article.get("title") or "").lower()
+    source = (article.get("source") or "").lower()
+    company_words = [w.lower() for w in company_name.replace("-", " ").split() if len(w) > 2]
+
+    if any(term in title or term in source for term in NEWS_NOISE_TERMS):
+        return False
+
+    has_company_match = ticker.lower() in title or any(word in title for word in company_words)
+    has_market_context = any(term in title for term in MARKET_TERMS)
+
+    return has_company_match and has_market_context
 
 def extract_between(text: str, start: str, end: str) -> str:
     try:
@@ -1223,12 +1270,53 @@ class StockBot:
 def run_dashboard():
     import streamlit as st
 
+    st.set_page_config(page_title="Ethan Yen AI Stock Signal Bot", layout="wide")
+
+    st.markdown("""
+    <style>
+    .main-title {
+        font-size: 42px;
+        font-weight: 800;
+        margin-bottom: 0px;
+    }
+    .subtitle {
+        font-size: 18px;
+        color: #777;
+        margin-bottom: 25px;
+    }
+    .signal-buy {
+        color: #12b886;
+        font-weight: 800;
+    }
+    .signal-sell {
+        color: #fa5252;
+        font-weight: 800;
+    }
+    .signal-hold {
+        color: #fab005;
+        font-weight: 800;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="main-title">Ethan Yen AI Stock Signal Bot</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">News, trend, momentum, volume, and paper-trading signal dashboard</div>', unsafe_allow_html=True)
+
     db = Database()
+    trader = PaperTrader(db)
 
-    st.set_page_config(page_title="AI Stock Signal Bot", layout="wide")
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("Paper Portfolio", f"${trader.portfolio_value():,.2f}")
+    col_b.metric("Cash", f"${db.get_cash():,.2f}")
+    col_c.metric("Stocks Tracked", len(WATCHLIST))
+    col_d.metric("Mode", "Paper Trading Only")
 
-    st.title("AI Stock News + Trend Scoring Bot")
-    st.caption("Research and paper-trading only. No real trades.")
+    if st.button("Refresh Data Now"):
+        with st.spinner("Updating prices, news, trends, and scores..."):
+            bot = StockBot()
+            bot.run_daily_update()
+        st.success("Data refreshed.")
+        st.rerun()
 
     rows = []
 
@@ -1240,8 +1328,11 @@ def run_dashboard():
             rows.append({
                 "Ticker": ticker,
                 "Company": company,
-                "Price": market.get("close"),
-                "Final Score": score.get("final_score"),
+                "Price": round(float(market.get("close") or 0), 2),
+                "1D %": round(float(market.get("return_1d") or 0) * 100, 2),
+                "5D %": round(float(market.get("return_5d") or 0) * 100, 2),
+                "20D %": round(float(market.get("return_20d") or 0) * 100, 2),
+                "Score": score.get("final_score"),
                 "Signal": score.get("signal"),
                 "News": score.get("news_score"),
                 "Trend": score.get("trend_score"),
@@ -1250,35 +1341,77 @@ def run_dashboard():
                 "Macro Risk": score.get("macro_risk_score"),
             })
 
-    if rows:
-        df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.warning("No scores yet. Run: python stock_bot.py")
+    if not rows:
+        st.warning("No data yet. Click Refresh Data Now.")
+        return
 
-    st.subheader("Portfolio")
-    trader = PaperTrader(db)
-    st.metric("Paper Portfolio Value", f"${trader.portfolio_value():,.2f}")
-    st.metric("Cash", f"${db.get_cash():,.2f}")
+    df = pd.DataFrame(rows).sort_values("Score", ascending=False)
 
-    st.subheader("Latest Explanations")
+    st.subheader("Top Ranked Stocks")
+    st.dataframe(df, width="stretch", hide_index=True)
 
-    for ticker in WATCHLIST:
+    best = df.iloc[0]
+    worst = df.iloc[-1]
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Highest Score", f"{best['Ticker']} - {best['Score']}")
+    col2.metric("Lowest Score", f"{worst['Ticker']} - {worst['Score']}")
+    col3.metric("Buy Signals", int((df["Signal"] == "BUY").sum()))
+
+    st.subheader("Stock Chart")
+    selected = st.selectbox("Choose a stock", df["Ticker"].tolist())
+
+    chart_data = yf.download(selected, period="6mo", progress=False, auto_adjust=True)
+
+    if not chart_data.empty:
+        st.line_chart(chart_data["Close"], width="stretch")
+
+        latest_price = float(chart_data["Close"].iloc[-1])
+        first_price = float(chart_data["Close"].iloc[0])
+        change = ((latest_price / first_price) - 1) * 100
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"{selected} Price", f"${latest_price:,.2f}")
+        c2.metric("6 Month Change", f"{change:.2f}%")
+        c3.metric("Rows of Price Data", len(chart_data))
+
+    st.subheader("Signal Details and News")
+
+    for ticker in df["Ticker"]:
         score = db.latest_score(ticker)
+        market = db.latest_market_row(ticker)
 
-        if not score:
+        if not score or not market:
             continue
 
-        with st.expander(f"{ticker} | Score {score['final_score']} | {score['signal']}"):
+        signal = score["signal"]
+        signal_class = "signal-hold"
+
+        if signal == "BUY":
+            signal_class = "signal-buy"
+        elif signal in ["SELL", "EMERGENCY_SELL"]:
+            signal_class = "signal-sell"
+
+        with st.expander(f"{ticker} | ${float(market.get('close') or 0):,.2f} | Score {score['final_score']} | {signal}"):
+            st.markdown(f'<p class="{signal_class}">Signal: {signal}</p>', unsafe_allow_html=True)
+
+            st.write("Why this score:")
             for reason in score.get("reasons", []):
                 st.write(f"- {reason}")
 
             news = db.recent_news(ticker)
 
             if news:
-                st.write("Recent headlines:")
-                for item in news[:5]:
-                    st.write(f"- {item.get('title')}")
+                st.write("Recent filtered stock headlines:")
+                for item in news[:6]:
+                    title = item.get("title")
+                    url = item.get("url")
+                    if url:
+                        st.markdown(f"- [{title}]({url})")
+                    else:
+                        st.write(f"- {title}")
+            else:
+                st.write("No recent filtered news found.")
 
 
 # =========================
