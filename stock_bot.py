@@ -457,6 +457,14 @@ class MarketDataCollector:
         if df.empty:
             return df
 
+        # yfinance sometimes returns MultiIndex columns like ("Close", "AAPL").
+        # Flatten them so the rest of the app can read normal names like Close, Open, Volume.
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        df = df.reset_index()
+        df = df.set_index("Date")
+
         df["return_1d"] = df["Close"].pct_change()
         df["return_5d"] = df["Close"].pct_change(5)
         df["return_20d"] = df["Close"].pct_change(20)
