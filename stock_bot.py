@@ -1484,7 +1484,7 @@ class StockBot:
         except Exception as e:
             print(f"Macro news failed: {e}")
 
-        for ticker, company in active_watchlist.items():
+        for ticker, company in WATCHLIST.items():
             print(f"\nUpdating {ticker} - {company}")
 
             try:
@@ -1916,6 +1916,242 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
         "benchmark": benchmark_df,
     }
 
+
+
+# =========================
+# PROFESSIONAL ANALYTICS
+# =========================
+
+SECTOR_MAP = {
+    "AAPL": "Technology", "MSFT": "Technology", "NVDA": "Semiconductors", "AMD": "Semiconductors",
+    "AVGO": "Semiconductors", "TSM": "Semiconductors", "ASML": "Semiconductors", "AMAT": "Semiconductors",
+    "MU": "Semiconductors", "ARM": "Semiconductors", "QCOM": "Semiconductors", "TXN": "Semiconductors",
+    "META": "Technology", "GOOGL": "Technology", "AMZN": "Consumer/Cloud", "NFLX": "Consumer/Media",
+    "CRM": "Cloud Software", "ORCL": "Cloud Software", "ADBE": "Cloud Software", "NOW": "Cloud Software",
+    "PANW": "Cybersecurity", "CRWD": "Cybersecurity", "PLTR": "AI/Data", "VRT": "AI Infrastructure",
+    "MRVL": "AI Infrastructure", "VEEV": "Healthcare Software", "TSLA": "Consumer/EV",
+    "UBER": "Consumer/Platform", "SHOP": "Consumer/Platform", "COIN": "Crypto/Finance",
+    "JPM": "Financials", "V": "Financials", "MA": "Financials", "BRK-B": "Financials",
+    "LLY": "Healthcare", "UNH": "Healthcare", "PFE": "Healthcare", "ABBV": "Healthcare", "ISRG": "Healthcare",
+    "XOM": "Energy", "COST": "Consumer Staples", "WMT": "Consumer Staples", "PEP": "Consumer Staples",
+    "HD": "Consumer Cyclical", "MCD": "Consumer", "BKNG": "Travel", "ABNB": "Travel",
+    "DIS": "Media", "CAT": "Industrials", "GE": "Aerospace/Defense", "RTX": "Aerospace/Defense",
+    "NKE": "Consumer", "SPY": "Benchmark", "QQQ": "Benchmark",
+}
+
+def get_risk_rating(market: Dict) -> str:
+    r20 = abs(float(market.get("return_20d") or 0))
+    r5 = abs(float(market.get("return_5d") or 0))
+    vol_ratio = float(market.get("volume_ratio") or 1)
+    rsi = float(market.get("rsi") or 50)
+
+    risk_points = 0
+
+    if r20 > 0.20:
+        risk_points += 3
+    elif r20 > 0.12:
+        risk_points += 2
+    elif r20 > 0.07:
+        risk_points += 1
+
+    if r5 > 0.08:
+        risk_points += 2
+    elif r5 > 0.05:
+        risk_points += 1
+
+    if vol_ratio > 2:
+        risk_points += 2
+    elif vol_ratio > 1.5:
+        risk_points += 1
+
+    if rsi > 75 or rsi < 25:
+        risk_points += 2
+    elif rsi > 68 or rsi < 32:
+        risk_points += 1
+
+    if risk_points >= 6:
+        return "VERY HIGH"
+    if risk_points >= 4:
+        return "HIGH"
+    if risk_points >= 2:
+        return "MEDIUM"
+    return "LOW"
+
+def get_confidence_rating(score: Dict, market: Dict) -> float:
+    components = [
+        float(score.get("news_score") or 50),
+        float(score.get("trend_score") or 50),
+        float(score.get("momentum_score") or 50),
+        float(score.get("volume_score") or 50),
+        float(score.get("macro_risk_score") or 50),
+    ]
+
+    final_score = float(score.get("final_score") or 50)
+    agreement = 100 - np.std(components)
+    data_quality = float(score.get("confidence_score") or 50)
+
+    confidence = agreement * 0.55 + data_quality * 0.30
+
+    if final_score >= 70 or final_score <= 40:
+        confidence += 10
+
+    if market.get("close") and market.get("volume"):
+        confidence += 5
+
+    return round(clamp(confidence), 1)
+
+def suggested_allocation(score: Dict, risk: str) -> float:
+    final_score = float(score.get("final_score") or 50)
+
+    if final_score < 60:
+        return 0.0
+
+    base = (final_score - 55) / 45 * 10
+
+    if risk == "VERY HIGH":
+        base *= 0.35
+    elif risk == "HIGH":
+        base *= 0.55
+    elif risk == "MEDIUM":
+        base *= 0.75
+
+    return round(clamp(base, 0, 10), 1)
+
+def expected_return_range(score: Dict, market: Dict) -> str:
+    final_score = float(score.get("final_score") or 50)
+    momentum = float(score.get("momentum_score") or 50)
+    macro = float(score.get("macro_risk_score") or 50)
+
+    estimate = (final_score - 50) * 0.35 + (momentum - 50) * 0.15 + (macro - 50) * 0.10
+
+    low = estimate - 5
+    high = estimate + 5
+
+    return f"{low:.1f}% to {high:.1f}%"
+
+def bull_bear_case(ticker: str, score: Dict, market: Dict, news: List[Dict]) -> Dict:
+    company = WATCHLIST.get(ticker, ticker)
+    final_score = float(score.get("final_score") or 50)
+    momentum = float(score.get("momentum_score") or 50)
+    news_score = float(score.get("news_score") or 50)
+    macro = float(score.get("macro_risk_score") or 50)
+    r20 = float(market.get("return_20d") or 0) * 100
+
+    bull = []
+    bear = []
+
+    if news_score >= 65:
+        bull.append("Recent company news sentiment is positive.")
+    elif news_score <= 40:
+        bear.append("Recent company news sentiment is weak or risk-heavy.")
+
+    if momentum >= 65:
+        bull.append("Price momentum is strong compared with recent history.")
+    elif momentum <= 40:
+        bear.append("Price momentum is weak.")
+
+    if macro >= 60:
+        bull.append("Macro conditions are not strongly negative for this stock.")
+    elif macro <= 40:
+        bear.append("Macro or government/economic news is adding risk.")
+
+    if r20 > 8:
+        bull.append(f"The stock is up {r20:.1f}% over 20 trading days.")
+    elif r20 < -8:
+        bear.append(f"The stock is down {abs(r20):.1f}% over 20 trading days.")
+
+    if news:
+        bull.append(f"Important headline: {news[0].get('title')}")
+
+    if not bull:
+        bull.append(f"{company} could benefit if its sector strengthens and market risk stays controlled.")
+
+    if not bear:
+        bear.append("Main risk is that sentiment, momentum, or macro conditions weaken after the signal.")
+
+    if final_score >= 70:
+        recommendation = "BUY / STRONG WATCH"
+    elif final_score >= 60:
+        recommendation = "WATCH"
+    elif final_score <= 45:
+        recommendation = "AVOID / SELL"
+    else:
+        recommendation = "HOLD / NEUTRAL"
+
+    return {
+        "bull": bull[:4],
+        "bear": bear[:4],
+        "recommendation": recommendation,
+    }
+
+def build_professional_table(db: Database, watchlist: Dict) -> pd.DataFrame:
+    rows = []
+
+    for ticker, company in watchlist.items():
+        score = db.latest_score(ticker)
+        market = db.latest_market_row(ticker)
+
+        if not score or not market:
+            continue
+
+        risk = get_risk_rating(market)
+        confidence = get_confidence_rating(score, market)
+        allocation = suggested_allocation(score, risk)
+
+        rows.append({
+            "Ticker": ticker,
+            "Company": company,
+            "Sector": SECTOR_MAP.get(ticker, "Other"),
+            "Price": float(market.get("close") or 0),
+            "Score": float(score.get("final_score") or 0),
+            "Signal": score.get("signal"),
+            "Confidence": confidence,
+            "Risk": risk,
+            "Suggested Allocation %": allocation,
+            "Expected 6M Return": expected_return_range(score, market),
+            "1D %": float(market.get("return_1d") or 0) * 100,
+            "5D %": float(market.get("return_5d") or 0) * 100,
+            "20D %": float(market.get("return_20d") or 0) * 100,
+            "RSI": float(market.get("rsi") or 0),
+            "Volume Ratio": float(market.get("volume_ratio") or 0),
+        })
+
+    return pd.DataFrame(rows)
+
+def portfolio_attribution_from_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame()
+
+    buys = trades[trades["Action"] == "BUY"].copy()
+    sells = trades[trades["Action"] == "SELL"].copy()
+
+    if buys.empty or sells.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for ticker in sorted(set(buys["Ticker"]).intersection(set(sells["Ticker"]))):
+        first_buy = buys[buys["Ticker"] == ticker].iloc[0]
+        last_sell = sells[sells["Ticker"] == ticker].iloc[-1]
+
+        buy_value = float(first_buy["Value"])
+        sell_value = float(last_sell["Value"])
+        pnl = sell_value - buy_value
+
+        rows.append({
+            "Ticker": ticker,
+            "Approx P/L": round(pnl, 2),
+            "Buy Price": first_buy["Price"],
+            "Sell Price": last_sell["Price"],
+        })
+
+    return pd.DataFrame(rows).sort_values("Approx P/L", ascending=False) if rows else pd.DataFrame()
+
+def get_upcoming_earnings_placeholder(ticker: str) -> str:
+    return "Add Finnhub/Polygon key for accurate earnings date"
+
+def get_analyst_placeholder(ticker: str) -> str:
+    return "Add Finnhub/Polygon/Benzinga key for analyst upgrades"
 
 # =========================
 # DASHBOARD
