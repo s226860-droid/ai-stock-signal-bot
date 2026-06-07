@@ -1273,10 +1273,10 @@ class StockBot:
 
 
 # =========================
-# 35-DAY STRATEGY SIMULATOR
+# ALGORITHM SIMULATOR
 # =========================
 
-def run_35_day_simulation(starting_cash: float = 10000, days: int = 35) -> Dict:
+def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> Dict:
     prices = {}
     score_rows = []
 
@@ -1460,10 +1460,57 @@ def run_35_day_simulation(starting_cash: float = 10000, days: int = 35) -> Dict:
             "open_positions": int(portfolio_df["Open Positions"].iloc[-1]),
         }
 
+    explanations = []
+
+    if not portfolio_df.empty:
+        temp = portfolio_df.copy()
+        temp["Daily Change"] = temp["Portfolio Value"].diff()
+        temp["Daily Change %"] = temp["Portfolio Value"].pct_change() * 100
+        major_moves = temp.dropna().copy()
+        major_moves = major_moves.reindex(major_moves["Daily Change %"].abs().sort_values(ascending=False).index).head(8)
+
+        for _, row in major_moves.iterrows():
+            change = float(row["Daily Change"])
+            change_pct = float(row["Daily Change %"])
+            day = row["Date"]
+
+            same_day_trades = trades_df[trades_df["Date"].astype(str) == str(day)] if not trades_df.empty else pd.DataFrame()
+
+            if change > 0:
+                reason = "Portfolio increased mainly because held positions moved higher."
+            else:
+                reason = "Portfolio decreased mainly because held positions moved lower or the algorithm reduced exposure."
+
+            if not same_day_trades.empty:
+                bought = same_day_trades[same_day_trades["Action"] == "BUY"]["Ticker"].tolist()
+                sold = same_day_trades[same_day_trades["Action"] == "SELL"]["Ticker"].tolist()
+
+                trade_notes = []
+                if bought:
+                    trade_notes.append("bought " + ", ".join(bought[:5]))
+                if sold:
+                    trade_notes.append("sold " + ", ".join(sold[:5]))
+
+                if trade_notes:
+                    reason += " The algorithm " + " and ".join(trade_notes) + "."
+
+            if abs(change_pct) > 4:
+                reason += " A move this large often happens during broad market volatility, earnings reactions, rate/inflation news, or sector-wide news."
+
+            explanations.append({
+                "Date": day,
+                "Portfolio Change": round(change, 2),
+                "Portfolio Change %": round(change_pct, 2),
+                "Estimated Reason": reason,
+            })
+
+    explanations_df = pd.DataFrame(explanations)
+
     return {
         "summary": summary,
         "portfolio_history": portfolio_df,
         "trades": trades_df,
+        "explanations": explanations_df,
     }
 
 
@@ -1512,13 +1559,14 @@ def run_dashboard():
     """, unsafe_allow_html=True)
 
     st.markdown('<div class="main-title">Ethan Yen AI Market Terminal</div>', unsafe_allow_html=True)
-    st.markdown('<div class="subtitle">Live prices, AI scores, market momentum, news sentiment, charts, and 35-day paper-trading simulator</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">Live prices, AI scores, market momentum, news sentiment, charts, and algorithm paper-trading simulator</div>', unsafe_allow_html=True)
 
     db = Database()
     trader = PaperTrader(db)
 
-    st.sidebar.title("Controls")
-    auto_refresh = st.sidebar.checkbox("Auto-load data if empty", value=True)
+    st.sidebar.title("Dashboard Controls")
+st.sidebar.caption("Use refresh when you want the newest prices, news, and AI scores.")
+    auto_refresh = True
     selected_period = st.sidebar.selectbox("Chart period", ["1mo", "3mo", "6mo", "1y", "2y"], index=1)
     selected_chart_type = st.sidebar.selectbox("Chart type", ["Close price", "Volume", "Close + moving averages"], index=0)
 
@@ -1594,7 +1642,7 @@ def run_dashboard():
     tab1, tab2, tab3, tab4 = st.tabs([
         "Market Dashboard",
         "Stock Deep Dive",
-        "35-Day Simulator",
+        "Algorithm Simulator",
         "News & Explanations",
     ])
 
@@ -1684,15 +1732,15 @@ def run_dashboard():
             st.bar_chart(breakdown, width="stretch")
 
     with tab3:
-        st.subheader("35-Day Paper Trading Simulator")
-        st.caption("This is a simplified historical simulator using price momentum and volume rules. It does not recreate historical news sentiment, so treat it as a strategy test, not proof of future performance.")
+        st.subheader("Algorithm Trading Simulator")
+        st.caption("Simulates how the algorithm would have traded over the selected period using historical price momentum and volume. News explanations are estimated from market movement, not true historical news archives.")
 
         sim_cash = st.number_input("Starting cash", min_value=1000, max_value=1000000, value=10000, step=1000)
-        sim_days = st.slider("Simulation period", min_value=10, max_value=60, value=35)
+        sim_days = st.slider("Simulation period", min_value=30, max_value=180, value=180)
 
-        if st.button("Run 35-Day Simulation"):
+        if st.button("Run Algorithm Simulation"):
             with st.spinner("Running historical paper-trading simulation..."):
-                result = run_35_day_simulation(starting_cash=sim_cash, days=sim_days)
+                result = run_algorithm_simulation(starting_cash=sim_cash, days=sim_days)
 
             summary = result["summary"]
             history = result["portfolio_history"]
@@ -1713,6 +1761,14 @@ def run_dashboard():
 
                 st.subheader("Portfolio Return %")
                 st.line_chart(history.set_index("Date")["Return %"], width="stretch")
+
+                st.subheader("Major Portfolio Moves")
+                explanations = result.get("explanations", pd.DataFrame())
+
+                if explanations.empty:
+                    st.info("No major portfolio moves detected.")
+                else:
+                    st.dataframe(explanations, width="stretch", hide_index=True)
 
                 st.subheader("Daily Portfolio History")
                 st.dataframe(history, width="stretch", hide_index=True)
