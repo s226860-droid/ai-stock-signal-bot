@@ -204,7 +204,25 @@ MACRO_NEGATIVE_TERMS = [
     "rate hike", "higher rates", "inflation rose", "hot inflation",
     "recession", "unemployment rises", "jobless claims rise",
     "bank stress", "default", "shutdown", "tariff", "sanctions",
-    "geopolitical risk", "war", "oil spike"
+    "geopolitical risk", "war", "oil spike", "trade war",
+    "export controls", "antitrust", "government investigation"
+]
+
+MACRO_GOOGLE_NEWS_QUERIES = [
+    "Trump tariffs stock market",
+    "Trump trade policy markets",
+    "White House tariffs stocks",
+    "Federal Reserve interest rates stock market",
+    "inflation CPI stock market",
+    "jobs report stock market",
+    "GDP growth stock market",
+    "Treasury yields tech stocks",
+    "new IPO stock market",
+    "Nasdaq IPO upcoming",
+    "SEC investigation public company",
+    "geopolitical risk stock market",
+    "oil prices stock market",
+    "AI regulation stock market",
 ]
 
 
@@ -663,6 +681,9 @@ class MacroNewsCollector:
         for source, url in MACRO_RSS_FEEDS.items():
             all_items.extend(self.fetch_rss(source, url))
 
+        all_items.extend(self.fetch_google_macro_searches())
+        all_items.extend(self.fetch_gdelt_macro_news())
+
         saved_items = []
 
         for item in all_items:
@@ -673,6 +694,51 @@ class MacroNewsCollector:
             saved_items.append(item)
 
         return saved_items
+
+    def fetch_google_macro_searches(self) -> List[Dict]:
+        items = []
+
+        for query in MACRO_GOOGLE_NEWS_QUERIES:
+            url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+            items.extend(self.fetch_rss(f"Google News: {query}", url))
+
+        return items
+
+    def fetch_gdelt_macro_news(self) -> List[Dict]:
+        query = "(stock market OR Nasdaq OR S&P 500 OR inflation OR Federal Reserve OR tariffs OR IPO OR Treasury yields OR oil prices)"
+        url = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+        params = {
+            "query": query,
+            "mode": "ArtList",
+            "format": "json",
+            "maxrecords": 50,
+            "sort": "HybridRel",
+        }
+
+        try:
+            response = requests.get(url, params=params, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+            data = response.json()
+        except Exception:
+            return []
+
+        items = []
+
+        for article in data.get("articles", []):
+            title = article.get("title") or ""
+            link = article.get("url") or ""
+
+            if not title:
+                continue
+
+            items.append({
+                "title": title,
+                "source": "GDELT Global News",
+                "url": link or f"gdelt:{hash(title)}",
+                "published_at": now_date(),
+            })
+
+        return items
 
     def fetch_rss(self, source: str, url: str) -> List[Dict]:
         try:
@@ -740,6 +806,7 @@ class NewsCollector:
         if self.gnews_api_key:
             articles.extend(self.fetch_gnews(ticker, company_name))
 
+        articles.extend(self.fetch_yahoo_finance_news(ticker))
         articles.extend(self.fetch_rss_fallback(ticker, company_name))
 
         filtered_articles = []
@@ -815,6 +882,34 @@ class NewsCollector:
                 "url": item.get("url") or "",
                 "published_at": item.get("publishedAt") or now_date(),
             })
+
+        return articles
+
+    def fetch_yahoo_finance_news(self, ticker: str) -> List[Dict]:
+        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
+
+        try:
+            response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            text = response.text
+        except Exception:
+            return []
+
+        articles = []
+        parts = text.split("<item>")[1:20]
+
+        for part in parts:
+            title = clean_html(extract_between(part, "<title>", "</title>"))
+            link = extract_between(part, "<link>", "</link>")
+            pub_date = extract_between(part, "<pubDate>", "</pubDate>")
+
+            if title:
+                articles.append({
+                    "ticker": ticker,
+                    "title": title,
+                    "source": "Yahoo Finance RSS",
+                    "url": link or f"yahoo:{ticker}:{hash(title)}",
+                    "published_at": parse_rss_date(pub_date),
+                })
 
         return articles
 
