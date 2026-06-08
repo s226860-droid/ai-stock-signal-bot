@@ -2,10 +2,7 @@ name: Paper Trading Bot
 
 on:
   schedule:
-    # Runs Monday-Friday at 6:45 AM Los Angeles time during PDT
-    # 13:45 UTC = 6:45 AM PDT
     - cron: "45 13 * * 1-5"
-
   workflow_dispatch:
 
 jobs:
@@ -31,13 +28,10 @@ jobs:
           ALPACA_BASE_URL: https://paper-api.alpaca.markets
           ENABLE_BROKER_ORDERS: "true"
           ENABLE_LIVE_ORDERS: "false"
-
           ENABLE_EMAIL_ALERTS: ${{ secrets.ENABLE_EMAIL_ALERTS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-
           NEWS_API_KEY: ${{ secrets.NEWS_API_KEY }}
           GNEWS_API_KEY: ${{ secrets.GNEWS_API_KEY }}
-
         run: python stock_bot.py
