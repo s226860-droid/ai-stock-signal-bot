@@ -2868,11 +2868,11 @@ def fetch_alpaca_account() -> Dict:
 
 
 def submit_alpaca_paper_order(ticker: str, side: str, dollars: float = 0.0) -> Dict:
-    if secret_value("ENABLE_LIVE_ORDERS", "false").lower() != "true":
+    if secret_value("ENABLE_BROKER_ORDERS", secret_value("ENABLE_LIVE_ORDERS", "false")).lower() != "true":
         return {
             "ok": False,
             "blocked": True,
-            "error": "ENABLE_LIVE_ORDERS is false, so no Alpaca order was sent.",
+            "error": "ENABLE_BROKER_ORDERS is false, so no Alpaca order was sent.",
         }
 
     if not alpaca_keys_ready():
@@ -3522,12 +3522,12 @@ def run_dashboard():
         st.caption("This is the bridge toward future automated buying and selling. It does not place real orders. It shows what the bot would approve, block, hold, or sell based on current scores and risk rules.")
 
         broker_mode = secret_value("BROKER_MODE", "database_paper")
-        live_orders = secret_value("ENABLE_LIVE_ORDERS", "false").lower() == "true"
+        live_orders = secret_value("ENABLE_BROKER_ORDERS", secret_value("ENABLE_LIVE_ORDERS", "false")).lower() == "true"
         manual_approval = secret_value("MANUAL_APPROVAL_REQUIRED", "true").lower() == "true"
 
         a1, a2, a3, a4 = st.columns(4)
         a1.metric("Broker Mode", broker_mode)
-        a2.metric("Live Orders", "ENABLED" if live_orders else "BLOCKED")
+        a2.metric("Broker Orders", "ENABLED" if live_orders else "BLOCKED")
         a3.metric("Manual Approval", "ON" if manual_approval else "OFF")
         a4.metric("Automation Status", "SAFE MODE" if not live_orders else "LIVE RISK")
 
@@ -3613,7 +3613,7 @@ def run_dashboard():
             ap1, ap2, ap3, ap4 = st.columns(4)
             ap1.metric("Alpaca Keys", "FOUND" if alpaca_ready else "MISSING")
             ap2.metric("Base URL", "PAPER" if "paper-api" in alpaca_base_url() else "LIVE URL")
-            ap3.metric("Order Sending", "ENABLED" if live_orders else "BLOCKED")
+            ap3.metric("Broker Orders", "ENABLED" if live_orders else "BLOCKED")
             ap4.metric("Connection", "OK" if account_response.get("ok") else "NOT CONNECTED")
 
             if account_response.get("ok"):
@@ -3628,7 +3628,7 @@ def run_dashboard():
                 st.info(account_response.get("error", "Alpaca is not connected yet."))
 
             st.subheader("Paper Order Test")
-            st.caption("This uses the approved automation plan. It will only send an Alpaca order if Alpaca keys exist and ENABLE_LIVE_ORDERS=true.")
+            st.caption("This uses the approved automation plan. It will only send an Alpaca order if Alpaca keys exist and ENABLE_BROKER_ORDERS=true.")
 
             executable = plan_df[plan_df["Decision"].isin(["BUY CANDIDATE", "SELL"])].copy()
 
