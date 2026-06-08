@@ -157,6 +157,17 @@ SELL_THRESHOLD = 45
 EMERGENCY_DROP = 25
 MAX_POSITION_SIZE = 0.10
 
+# =========================
+# STAGE 5 PAPER AUTO-TRADING SAFETY CONFIG
+# =========================
+STOP_LOSS_PCT = -0.08
+TAKE_PROFIT_PCT = 0.18
+TRAILING_STOP_PCT = -0.10
+MAX_HOLD_DAYS = 45
+MAX_OPEN_POSITIONS = 5
+MIN_TRADE_DOLLARS = 50
+MIN_BUY_CONFIDENCE = 50
+
 ENABLE_REAL_TRADING = False
 ALLOW_EARNINGS_TRADES = False
 
@@ -370,6 +381,38 @@ class Database:
             ticker TEXT PRIMARY KEY,
             shares REAL,
             avg_price REAL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS position_meta (
+            ticker TEXT PRIMARY KEY,
+            entry_date TEXT,
+            entry_score REAL,
+            high_water_price REAL,
+            last_updated TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            started_at TEXT,
+            finished_at TEXT,
+            status TEXT,
+            errors TEXT,
+            portfolio_value REAL,
+            cash REAL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS health_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            severity TEXT,
+            component TEXT,
+            message TEXT
         )
         """)
 
@@ -614,6 +657,87 @@ class Database:
             """, (ticker, shares, avg_price))
 
         self.conn.commit()
+
+    def log_health_event(self, severity: str, component: str, message: str):
+        cur = self.conn.cursor()
+        cur.execute("""
+        INSERT INTO health_events (created_at, severity, component, message)
+        VALUES (?, ?, ?, ?)
+        """, (now_date(), severity, component, message))
+        self.conn.commit()
+
+    def start_bot_run(self) -> int:
+        cur = self.conn.cursor()
+        cur.execute("""
+        INSERT INTO bot_runs (started_at, status, errors, portfolio_value, cash)
+        VALUES (?, ?, ?, ?, ?)
+        """, (now_date(), "RUNNING", "[]", None, self.get_cash()))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def finish_bot_run(self, run_id: int, status: str, errors: List[str], portfolio_value: float):
+        cur = self.conn.cursor()
+        cur.execute("""
+        UPDATE bot_runs
+        SET finished_at = ?, status = ?, errors = ?, portfolio_value = ?, cash = ?
+        WHERE id = ?
+        """, (now_date(), status, json.dumps(errors), portfolio_value, self.get_cash(), run_id))
+        self.conn.commit()
+
+    def open_position_count(self) -> int:
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM portfolio")
+        return int(cur.fetchone()[0])
+
+    def get_position_meta(self, ticker: str) -> Optional[Dict]:
+        cur = self.conn.cursor()
+        cur.execute("SELECT ticker, entry_date, entry_score, high_water_price, last_updated FROM position_meta WHERE ticker = ?", (ticker,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "ticker": row[0],
+            "entry_date": row[1],
+            "entry_score": row[2],
+            "high_water_price": row[3],
+            "last_updated": row[4],
+        }
+
+    def upsert_position_meta(self, ticker: str, entry_score: float, current_price: float):
+        existing = self.get_position_meta(ticker)
+
+        if existing:
+            entry_date = existing.get("entry_date") or now_date()[:10]
+            old_high = existing.get("high_water_price") or current_price
+            high_water = max(float(old_high), float(current_price))
+            original_entry_score = existing.get("entry_score") or entry_score
+        else:
+            entry_date = now_date()[:10]
+            high_water = current_price
+            original_entry_score = entry_score
+
+        cur = self.conn.cursor()
+        cur.execute("""
+        INSERT OR REPLACE INTO position_meta
+        (ticker, entry_date, entry_score, high_water_price, last_updated)
+        VALUES (?, ?, ?, ?, ?)
+        """, (ticker, entry_date, original_entry_score, high_water, now_date()))
+        self.conn.commit()
+
+    def delete_position_meta(self, ticker: str):
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM position_meta WHERE ticker = ?", (ticker,))
+        self.conn.commit()
+
+    def already_traded_today(self, ticker: str, action: str) -> bool:
+        cur = self.conn.cursor()
+        cur.execute("""
+        SELECT 1 FROM paper_trades
+        WHERE date LIKE ? AND ticker = ? AND action = ?
+        LIMIT 1
+        """, (now_date()[:10] + "%", ticker, action))
+        return cur.fetchone() is not None
+
 
     def log_trade(self, trade: Dict):
         cur = self.conn.cursor()
@@ -1487,21 +1611,91 @@ class PaperTrader:
         market = self.db.latest_market_row(ticker)
 
         if not market or not market.get("close"):
+            self.db.log_health_event("WARNING", "market_data", f"No latest market price for {ticker}")
             return
 
         price = float(market["close"])
         cash = self.db.get_cash()
         total_value = self.portfolio_value()
         position = self.db.get_position(ticker)
+        final_score = float(score.get("final_score") or 50)
+        confidence_score = float(score.get("confidence_score") or 0)
+
+        if position:
+            self.db.upsert_position_meta(ticker, final_score, price)
+            meta = self.db.get_position_meta(ticker) or {}
+
+            entry_price = float(position["avg_price"])
+            high_water = float(meta.get("high_water_price") or price)
+            return_pct = (price / entry_price) - 1
+            trailing_drawdown = (price / high_water) - 1
+
+            entry_date_text = meta.get("entry_date") or now_date()[:10]
+            try:
+                entry_date = dt.date.fromisoformat(entry_date_text[:10])
+                hold_days = (dt.date.today() - entry_date).days
+            except Exception:
+                hold_days = 0
+
+            exit_reason = None
+            exit_action = "SELL"
+
+            if signal == "EMERGENCY_SELL":
+                exit_reason = "Emergency score drop triggered sell."
+                exit_action = "EMERGENCY_SELL"
+            elif return_pct <= STOP_LOSS_PCT:
+                exit_reason = f"Stop loss triggered at {return_pct:.2%}."
+            elif trailing_drawdown <= TRAILING_STOP_PCT:
+                exit_reason = f"Trailing stop triggered at {trailing_drawdown:.2%} from high."
+            elif return_pct >= TAKE_PROFIT_PCT:
+                exit_reason = f"Take profit triggered at {return_pct:.2%}."
+            elif signal == "SELL" or final_score <= SELL_THRESHOLD:
+                exit_reason = f"AI score sell triggered. Score: {final_score:.1f}."
+            elif hold_days >= MAX_HOLD_DAYS and final_score < BUY_THRESHOLD:
+                exit_reason = f"Max hold period reached: {hold_days} days."
+
+            if exit_reason:
+                if self.db.already_traded_today(ticker, exit_action):
+                    return
+
+                shares = float(position["shares"])
+                proceeds = shares * price
+                cash_after = cash + proceeds
+
+                self.db.set_cash(cash_after)
+                self.db.upsert_position(ticker, 0, 0)
+                self.db.delete_position_meta(ticker)
+
+                self.db.log_trade({
+                    "date": now_date(),
+                    "ticker": ticker,
+                    "action": exit_action,
+                    "shares": shares,
+                    "price": price,
+                    "cash_after": cash_after,
+                    "portfolio_value": self.portfolio_value(),
+                    "reason": exit_reason,
+                })
+
+                return
 
         if signal == "BUY":
             if position:
                 return
 
+            if self.db.open_position_count() >= MAX_OPEN_POSITIONS:
+                return
+
+            if confidence_score < MIN_BUY_CONFIDENCE:
+                return
+
+            if self.db.already_traded_today(ticker, "BUY"):
+                return
+
             max_dollars = total_value * MAX_POSITION_SIZE
             dollars_to_spend = min(cash, max_dollars)
 
-            if dollars_to_spend < 50:
+            if dollars_to_spend < MIN_TRADE_DOLLARS:
                 return
 
             shares = dollars_to_spend / price
@@ -1509,6 +1703,7 @@ class PaperTrader:
 
             self.db.set_cash(cash_after)
             self.db.upsert_position(ticker, shares, price)
+            self.db.upsert_position_meta(ticker, final_score, price)
 
             self.db.log_trade({
                 "date": now_date(),
@@ -1518,29 +1713,7 @@ class PaperTrader:
                 "price": price,
                 "cash_after": cash_after,
                 "portfolio_value": self.portfolio_value(),
-                "reason": "Score crossed buy threshold.",
-            })
-
-        elif signal in ["SELL", "EMERGENCY_SELL"]:
-            if not position:
-                return
-
-            shares = position["shares"]
-            proceeds = shares * price
-            cash_after = cash + proceeds
-
-            self.db.set_cash(cash_after)
-            self.db.upsert_position(ticker, 0, 0)
-
-            self.db.log_trade({
-                "date": now_date(),
-                "ticker": ticker,
-                "action": signal,
-                "shares": shares,
-                "price": price,
-                "cash_after": cash_after,
-                "portfolio_value": self.portfolio_value(),
-                "reason": "Score dropped below sell threshold.",
+                "reason": f"Buy signal. Score: {final_score:.1f}. Confidence: {confidence_score:.1f}.",
             })
 
 
@@ -1619,12 +1792,17 @@ class StockBot:
 
     def run_daily_update(self):
         results = []
+        errors = []
+        run_id = self.db.start_bot_run()
 
         try:
             macro_items = self.macro.fetch_all()
             print(f"Macro/government news items found: {len(macro_items)}")
         except Exception as e:
-            print(f"Macro news failed: {e}")
+            msg = f"Macro news failed: {e}"
+            errors.append(msg)
+            self.db.log_health_event("ERROR", "macro_news", msg)
+            print(msg)
 
         for ticker, company in WATCHLIST.items():
             print(f"\nUpdating {ticker} - {company}")
@@ -1633,13 +1811,19 @@ class StockBot:
                 self.market.fetch(ticker)
                 print("Market data updated.")
             except Exception as e:
-                print(f"Market data failed: {e}")
+                msg = f"Market data failed for {ticker}: {e}"
+                errors.append(msg)
+                self.db.log_health_event("ERROR", "market_data", msg)
+                print(msg)
 
             try:
                 articles = self.news.fetch_for_ticker(ticker, company)
                 print(f"News articles found: {len(articles)}")
             except Exception as e:
-                print(f"News failed: {e}")
+                msg = f"News failed for {ticker}: {e}"
+                errors.append(msg)
+                self.db.log_health_event("ERROR", "news", msg)
+                print(msg)
 
             try:
                 score = self.scorer.score_stock(ticker, company)
@@ -1651,9 +1835,17 @@ class StockBot:
                 results.append(score)
 
             except Exception as e:
-                print(f"Scoring failed: {e}")
+                msg = f"Scoring failed for {ticker}: {e}"
+                errors.append(msg)
+                self.db.log_health_event("ERROR", "scoring", msg)
+                print(msg)
 
-        print("\nPortfolio value:", round(self.trader.portfolio_value(), 2))
+        final_value = round(self.trader.portfolio_value(), 2)
+        status = "OK" if not errors else "PARTIAL_FAILURE"
+        self.db.finish_bot_run(run_id, status, errors, final_value)
+
+        print("\nPortfolio value:", final_value)
+        print("Bot run status:", status)
         return results
 
 
