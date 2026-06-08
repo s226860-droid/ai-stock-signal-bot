@@ -2629,7 +2629,7 @@ def get_analyst_placeholder(ticker: str) -> str:
     return "Add Finnhub/Polygon/Benzinga key for analyst upgrades"
 
 
-def automation_trade_plan_table(db: Database, watchlist: Dict, regime: Optional[Dict] = None) -> pd.DataFrame:
+def automation_trade_plan_table(db: Database, watchlist: Dict, regime: Optional[Dict] = None, test_mode: str = "Off", test_ticker: Optional[str] = None) -> pd.DataFrame:
     if regime is None:
         regime = get_market_regime_snapshot()
 
@@ -2651,6 +2651,21 @@ def automation_trade_plan_table(db: Database, watchlist: Dict, regime: Optional[
         risk = get_risk_rating(market)
         signal = score.get("signal")
         position = db.get_position(ticker)
+
+        if test_mode != "Off" and ticker == test_ticker:
+            if test_mode == "Force Approved Buy":
+                signal = "BUY"
+                final_score = max(final_score, 88)
+                risk_adjusted = max(risk_adjusted, 82)
+                confidence = max(confidence, 78)
+            elif test_mode == "Force Blocked Buy":
+                signal = "BUY"
+                final_score = max(final_score, 78)
+                risk_adjusted = min(risk_adjusted, 55)
+                confidence = min(confidence, 52)
+            elif test_mode == "Force Sell":
+                signal = "SELL"
+                position = position or {"ticker": ticker, "shares": 1, "avg_price": close}
 
         decision = "HOLD"
         allowed = False
@@ -3225,8 +3240,29 @@ def run_dashboard():
         else:
             st.success("Safe mode is active. This tab plans trades but does not send real broker orders.")
 
+        st.divider()
+        st.subheader("Force Test Mode")
+        st.caption("Use this only to test whether the automation table displays buy, blocked buy, and sell states correctly. It does not change real scores or place orders.")
+
+        test_mode = st.selectbox(
+            "Test scenario",
+            ["Off", "Force Approved Buy", "Force Blocked Buy", "Force Sell"],
+            index=0,
+            key="automation_test_mode",
+        )
+
+        test_ticker = st.selectbox(
+            "Test ticker",
+            list(active_watchlist.keys()),
+            index=0,
+            key="automation_test_ticker",
+        )
+
         regime_for_auto = get_market_regime_snapshot()
-        plan_df = automation_trade_plan_table(db, active_watchlist, regime_for_auto)
+        plan_df = automation_trade_plan_table(db, active_watchlist, regime_for_auto, test_mode=test_mode, test_ticker=test_ticker)
+
+        if test_mode != "Off":
+            st.warning(f"Test mode is active for {test_ticker}: {test_mode}. This is only a display simulation.")
 
         if plan_df.empty:
             st.info("No automation decisions available yet. Refresh data first.")
