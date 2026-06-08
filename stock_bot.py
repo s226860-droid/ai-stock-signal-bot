@@ -2628,6 +2628,142 @@ def get_upcoming_earnings_placeholder(ticker: str) -> str:
 def get_analyst_placeholder(ticker: str) -> str:
     return "Add Finnhub/Polygon/Benzinga key for analyst upgrades"
 
+
+def automation_trade_plan_table(db: Database, watchlist: Dict, regime: Optional[Dict] = None) -> pd.DataFrame:
+    if regime is None:
+        regime = get_market_regime_snapshot()
+
+    rows = []
+    portfolio_value = PaperTrader(db).portfolio_value()
+    cash = db.get_cash()
+    current_exposure = 0 if portfolio_value <= 0 else max(0, min(1, (portfolio_value - cash) / portfolio_value))
+
+    for ticker, company in watchlist.items():
+        score = db.latest_score(ticker)
+        market = db.latest_market_row(ticker)
+
+        if not score or not market:
+            continue
+
+        final_score = float(score.get("final_score") or 0)
+        risk_adjusted = calculate_risk_adjusted_score(score, market)
+        confidence = get_confidence_rating(score, market)
+        risk = get_risk_rating(market)
+        signal = score.get("signal")
+        position = db.get_position(ticker)
+
+        decision = "HOLD"
+        allowed = False
+        suggested_dollars = 0.0
+        reasons = []
+
+        close = float(market.get("close") or 0)
+        ma20 = float(market.get("ma_20") or 0)
+        ma50 = float(market.get("ma_50") or 0)
+        rsi = float(market.get("rsi") or 50)
+
+        if signal == "BUY" and not position:
+            decision = "BUY CANDIDATE"
+            allowed = True
+
+            if final_score < BUY_THRESHOLD:
+                allowed = False
+                reasons.append(f"score {final_score:.1f} below buy threshold")
+            if risk_adjusted < 68:
+                allowed = False
+                reasons.append(f"risk-adjusted score {risk_adjusted:.1f} below 68")
+            if confidence < 60:
+                allowed = False
+                reasons.append(f"confidence {confidence:.1f} below 60")
+            if regime["score"] < 45:
+                allowed = False
+                reasons.append("market regime too weak")
+            if close and ma20 and close < ma20:
+                allowed = False
+                reasons.append("below 20-day moving average")
+            if close and ma50 and close < ma50:
+                allowed = False
+                reasons.append("below 50-day moving average")
+            if rsi > 78:
+                allowed = False
+                reasons.append("RSI too overbought")
+            if current_exposure >= regime["max_exposure"]:
+                allowed = False
+                reasons.append("portfolio exposure already too high")
+            if cash <= portfolio_value * regime["cash_minimum"]:
+                allowed = False
+                reasons.append("cash reserve too low")
+
+            if allowed:
+                base_fraction = 0.03
+                if final_score >= 85 and confidence >= 75 and risk_adjusted >= 78:
+                    base_fraction = 0.10
+                elif final_score >= 78 and confidence >= 68:
+                    base_fraction = 0.07
+                elif final_score >= 72:
+                    base_fraction = 0.05
+
+                if regime["score"] < 55:
+                    base_fraction *= 0.50
+                elif regime["score"] > 70:
+                    base_fraction *= 1.10
+
+                if risk == "VERY HIGH":
+                    base_fraction *= 0.35
+                elif risk == "HIGH":
+                    base_fraction *= 0.55
+                elif risk == "MEDIUM":
+                    base_fraction *= 0.75
+
+                suggested_dollars = min(cash, portfolio_value * min(base_fraction, MAX_POSITION_SIZE))
+                reasons.append("approved by automation rules")
+            else:
+                decision = "BLOCKED BUY"
+
+        elif signal in ["SELL", "EMERGENCY_SELL"] and position:
+            decision = "SELL"
+            allowed = True
+            reasons.append("sell signal active and position exists")
+
+        elif signal == "BUY" and position:
+            decision = "HOLD EXISTING"
+            reasons.append("already holding position")
+
+        else:
+            decision = "HOLD"
+            reasons.append("no executable signal")
+
+        rows.append({
+            "Ticker": ticker,
+            "Company": company,
+            "Signal": signal,
+            "Decision": decision,
+            "Allowed": allowed,
+            "Suggested Dollars": round(float(suggested_dollars), 2),
+            "Score": round(final_score, 1),
+            "Risk Adjusted Score": round(risk_adjusted, 1),
+            "Confidence": round(confidence, 1),
+            "Risk": risk,
+            "Position Exists": bool(position),
+            "Main Reason": "; ".join(reasons[:3]),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    priority = {
+        "SELL": 0,
+        "BUY CANDIDATE": 1,
+        "BLOCKED BUY": 2,
+        "HOLD EXISTING": 3,
+        "HOLD": 4,
+    }
+    out["_priority"] = out["Decision"].map(priority).fillna(9)
+    out = out.sort_values(["_priority", "Risk Adjusted Score", "Confidence"], ascending=[True, False, False])
+    return out.drop(columns=["_priority"])
+
+
 # =========================
 # DASHBOARD
 # =========================
@@ -2812,12 +2948,13 @@ def run_dashboard():
 
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "Market Dashboard",
         "Stock Deep Dive",
         "Algorithm Simulator",
         "News & Explanations",
         "Risk & Allocation",
+        "Automation Trade Plan",
     ])
 
     with tab1:
@@ -3067,6 +3204,74 @@ def run_dashboard():
                 width="stretch",
                 hide_index=True,
             )
+
+
+    with tab6:
+        st.subheader("Automation Trade Plan")
+        st.caption("This is the bridge toward future automated buying and selling. It does not place real orders. It shows what the bot would approve, block, hold, or sell based on current scores and risk rules.")
+
+        broker_mode = os.getenv("BROKER_MODE", "database_paper")
+        live_orders = os.getenv("ENABLE_LIVE_ORDERS", "false").lower() == "true"
+        manual_approval = os.getenv("MANUAL_APPROVAL_REQUIRED", "true").lower() == "true"
+
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Broker Mode", broker_mode)
+        a2.metric("Live Orders", "ENABLED" if live_orders else "BLOCKED")
+        a3.metric("Manual Approval", "ON" if manual_approval else "OFF")
+        a4.metric("Automation Status", "SAFE MODE" if not live_orders else "LIVE RISK")
+
+        if live_orders:
+            st.error("Live orders are enabled. Only use this after long paper testing and broker safety checks.")
+        else:
+            st.success("Safe mode is active. This tab plans trades but does not send real broker orders.")
+
+        regime_for_auto = get_market_regime_snapshot()
+        plan_df = automation_trade_plan_table(db, active_watchlist, regime_for_auto)
+
+        if plan_df.empty:
+            st.info("No automation decisions available yet. Refresh data first.")
+        else:
+            buy_candidates = int((plan_df["Decision"] == "BUY CANDIDATE").sum())
+            blocked_buys = int((plan_df["Decision"] == "BLOCKED BUY").sum())
+            sells = int((plan_df["Decision"] == "SELL").sum())
+            holds = int(plan_df["Decision"].isin(["HOLD", "HOLD EXISTING"]).sum())
+
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Approved Buys", buy_candidates)
+            d2.metric("Blocked Buys", blocked_buys)
+            d3.metric("Sells", sells)
+            d4.metric("Holds", holds)
+
+            st.subheader("Trade Decision Table")
+            st.dataframe(
+                plan_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Allowed": st.column_config.CheckboxColumn("Allowed"),
+                    "Suggested Dollars": st.column_config.NumberColumn("Suggested Dollars", format="$%.2f"),
+                    "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%.1f"),
+                    "Risk Adjusted Score": st.column_config.ProgressColumn("Risk Adjusted Score", min_value=0, max_value=100, format="%.1f"),
+                    "Confidence": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100, format="%.1f"),
+                },
+            )
+
+            approved = plan_df[plan_df["Decision"].isin(["BUY CANDIDATE", "SELL"])]
+            blocked = plan_df[plan_df["Decision"] == "BLOCKED BUY"]
+
+            st.subheader("Approved Actions")
+            if approved.empty:
+                st.info("No buys or sells are approved right now.")
+            else:
+                st.dataframe(approved, width="stretch", hide_index=True)
+
+            st.subheader("Blocked Buy Reasons")
+            if blocked.empty:
+                st.info("No blocked buy signals right now.")
+            else:
+                st.dataframe(blocked[["Ticker", "Company", "Score", "Risk Adjusted Score", "Confidence", "Risk", "Main Reason"]], width="stretch", hide_index=True)
+
+        st.warning("Future live trading should only be connected after broker paper trading, logging, kill switches, and order reconciliation are tested.")
 
 
 # =========================
