@@ -21,9 +21,12 @@ import os
 import sqlite3
 import json
 import math
+import re
+import smtplib
 import datetime as dt
 from pathlib import Path
 from dataclasses import dataclass
+from email.message import EmailMessage
 from typing import List, Dict, Optional, Tuple
 
 import requests
@@ -167,6 +170,16 @@ MAX_HOLD_DAYS = 45
 MAX_OPEN_POSITIONS = 5
 MIN_TRADE_DOLLARS = 50
 MIN_BUY_CONFIDENCE = 50
+MAX_DAILY_LOSS_PCT = -0.035
+MAX_TRIAL_DRAWDOWN_PCT = -0.08
+LOSS_COOLDOWN_DAYS = 3
+EXTREME_VOLATILITY_20D = 0.055
+HIGH_VOLATILITY_20D = 0.035
+MAX_SECTOR_EXPOSURE = 0.35
+BACKTEST_SLIPPAGE_BPS = 8
+BACKTEST_SPREAD_BPS = 4
+BACKTEST_FEE_PER_TRADE = 0.00
+MIN_TRIAL_TRADES = 8
 
 ENABLE_REAL_TRADING = False
 ALLOW_EARNINGS_TRADES = False
@@ -183,6 +196,72 @@ MARKET_TERMS = [
     "market", "nasdaq", "nyse", "investor", "dividend", "valuation",
     "ai", "chip", "cloud", "sales", "quarter", "growth"
 ]
+
+LOW_QUALITY_NEWS_TERMS = [
+    "penny stock", "millionaire", "guaranteed", "secret stock", "click here",
+    "shocking", "you won't believe", "sponsored", "advertorial", "prediction"
+]
+
+CATALYST_KEYWORDS = {
+    "earnings": ["earnings", "eps", "quarterly results", "reports results"],
+    "guidance": ["guidance", "outlook", "forecast", "raises forecast", "cuts forecast"],
+    "analyst_upgrade": ["upgrade", "upgraded", "raises rating", "outperform"],
+    "analyst_downgrade": ["downgrade", "downgraded", "cuts rating", "underperform"],
+    "price_target": ["price target", "target price", "raises target", "cuts target"],
+    "lawsuit": ["lawsuit", "sued", "class action", "settlement"],
+    "investigation": ["investigation", "probe", "subpoena", "sec investigation"],
+    "sec_filing": ["sec filing", "10-k", "10-q", "8-k", "form 4", "s-1"],
+    "merger_acquisition": ["merger", "acquisition", "acquire", "buyout", "takeover"],
+    "product_launch": ["product launch", "launches", "new product", "release"],
+    "fda_approval": ["fda approval", "approved by fda", "phase 3", "clinical trial"],
+    "ai_chip_demand": ["ai chip", "data center", "gpu demand", "accelerator", "semiconductor demand"],
+    "macro_policy": ["tariff", "federal reserve", "treasury yield", "white house", "inflation"],
+    "ipo": ["ipo", "initial public offering", "nasdaq debut", "s-1 filing"],
+    "general": [],
+}
+
+POSITIVE_CATALYST_TYPES = {
+    "analyst_upgrade", "product_launch", "fda_approval", "ai_chip_demand",
+    "merger_acquisition", "price_target"
+}
+
+NEGATIVE_CATALYST_TYPES = {
+    "analyst_downgrade", "lawsuit", "investigation"
+}
+
+SOURCE_RELIABILITY = {
+    "SEC": 1.00,
+    "Federal Reserve": 1.00,
+    "Treasury": 0.98,
+    "BLS": 0.98,
+    "BEA": 0.98,
+    "White House": 0.95,
+    "Yahoo Finance RSS": 0.78,
+    "NewsAPI": 0.72,
+    "GNews": 0.70,
+    "Google News RSS": 0.62,
+    "GDELT Global News": 0.58,
+    "Nasdaq IPO News": 0.72,
+}
+
+COMPANY_CATALYST_FEEDS = {
+    "SEC Press Releases": "https://www.sec.gov/news/pressreleases.rss",
+    "Federal Reserve": "https://www.federalreserve.gov/feeds/press_all.xml",
+    "Treasury": "https://home.treasury.gov/news/press-releases/feed",
+    "BLS": "https://www.bls.gov/feed/news_release.rss",
+    "BEA": "https://www.bea.gov/news/current-releases/rss.xml",
+    "White House": "https://www.whitehouse.gov/feed/",
+    "Nasdaq IPO News": "https://www.nasdaq.com/feed/rssoutbound?category=IPOs",
+}
+
+CATALYST_SEARCH_TERMS = [
+    "earnings", "guidance", "analyst upgrade", "analyst downgrade",
+    "price target", "lawsuit", "investigation", "SEC filing",
+    "merger", "acquisition", "product launch"
+]
+
+TECH_CATALYST_SEARCH_TERMS = ["AI data center chip demand", "semiconductor demand", "cloud AI spending"]
+HEALTHCARE_CATALYST_SEARCH_TERMS = ["FDA approval", "clinical trial", "phase 3 data"]
 
 
 COMPANY_DESCRIPTIONS = {
@@ -312,6 +391,7 @@ class Database:
             ma_20 REAL,
             ma_50 REAL,
             rsi REAL,
+            volatility_20d REAL,
             volume_ratio REAL,
             PRIMARY KEY (ticker, date)
         )
@@ -327,6 +407,9 @@ class Database:
             published_at TEXT,
             sentiment REAL,
             surprise_type TEXT,
+            catalyst_type TEXT,
+            source_reliability REAL,
+            relevance_score REAL,
             created_at TEXT
         )
         """)
@@ -373,6 +456,27 @@ class Database:
             cash_after REAL,
             portfolio_value REAL,
             reason TEXT
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS trial_days (
+            date TEXT PRIMARY KEY,
+            signals_generated INTEGER,
+            approved_buys INTEGER,
+            approved_sells INTEGER,
+            skipped_trades INTEGER,
+            paper_orders INTEGER,
+            alpaca_reconciliation_status TEXT,
+            cash REAL,
+            positions INTEGER,
+            portfolio_value REAL,
+            daily_return REAL,
+            cumulative_return REAL,
+            drawdown REAL,
+            errors TEXT,
+            safety_pass INTEGER,
+            created_at TEXT
         )
         """)
 
@@ -428,7 +532,22 @@ class Database:
         VALUES (1, ?)
         """, (STARTING_CASH,))
 
+        self.ensure_schema_columns()
+
         self.conn.commit()
+
+    def ensure_schema_columns(self):
+        def add_column_if_missing(table: str, column: str, definition: str):
+            cur = self.conn.cursor()
+            cur.execute(f"PRAGMA table_info({table})")
+            existing = {row[1] for row in cur.fetchall()}
+            if column not in existing:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+        add_column_if_missing("market_data", "volatility_20d", "REAL")
+        add_column_if_missing("news", "catalyst_type", "TEXT")
+        add_column_if_missing("news", "source_reliability", "REAL")
+        add_column_if_missing("news", "relevance_score", "REAL")
 
     def save_market_data(self, ticker: str, df: pd.DataFrame):
         cur = self.conn.cursor()
@@ -436,7 +555,9 @@ class Database:
         for date, row in df.iterrows():
             cur.execute("""
             INSERT OR REPLACE INTO market_data
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (ticker, date, open, high, low, close, volume, return_1d, return_5d, return_20d,
+             ma_5, ma_20, ma_50, rsi, volatility_20d, volume_ratio)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 ticker,
                 str(date.date()),
@@ -452,6 +573,7 @@ class Database:
                 safe_float(row.get("ma_20")),
                 safe_float(row.get("ma_50")),
                 safe_float(row.get("rsi")),
+                safe_float(row.get("volatility_20d")),
                 safe_float(row.get("volume_ratio")),
             ))
 
@@ -463,8 +585,8 @@ class Database:
         try:
             cur.execute("""
             INSERT OR IGNORE INTO news
-            (ticker, title, source, url, published_at, sentiment, surprise_type, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (ticker, title, source, url, published_at, sentiment, surprise_type, catalyst_type, source_reliability, relevance_score, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 item["ticker"],
                 item["title"],
@@ -473,6 +595,9 @@ class Database:
                 item["published_at"],
                 item.get("sentiment"),
                 item.get("surprise_type"),
+                item.get("catalyst_type"),
+                item.get("source_reliability"),
+                item.get("relevance_score"),
                 now_date(),
             ))
             self.conn.commit()
@@ -564,7 +689,7 @@ class Database:
         cutoff = dt.datetime.now() - dt.timedelta(days=days)
 
         cur.execute("""
-        SELECT ticker, title, source, url, published_at, sentiment, surprise_type
+        SELECT ticker, title, source, url, published_at, sentiment, surprise_type, catalyst_type, source_reliability, relevance_score
         FROM news
         WHERE ticker = ?
         AND published_at >= ?
@@ -759,6 +884,50 @@ class Database:
 
         self.conn.commit()
 
+    def save_trial_day(self, row: Dict):
+        cur = self.conn.cursor()
+        cur.execute("""
+        INSERT OR REPLACE INTO trial_days
+        (date, signals_generated, approved_buys, approved_sells, skipped_trades, paper_orders,
+         alpaca_reconciliation_status, cash, positions, portfolio_value, daily_return,
+         cumulative_return, drawdown, errors, safety_pass, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            row["date"],
+            row.get("signals_generated", 0),
+            row.get("approved_buys", 0),
+            row.get("approved_sells", 0),
+            row.get("skipped_trades", 0),
+            row.get("paper_orders", 0),
+            row.get("alpaca_reconciliation_status", "not_checked"),
+            row.get("cash", 0),
+            row.get("positions", 0),
+            row.get("portfolio_value", 0),
+            row.get("daily_return", 0),
+            row.get("cumulative_return", 0),
+            row.get("drawdown", 0),
+            json.dumps(row.get("errors", [])),
+            1 if row.get("safety_pass", False) else 0,
+            now_date(),
+        ))
+        self.conn.commit()
+
+    def recent_trial_days(self, limit: int = 60) -> pd.DataFrame:
+        try:
+            cur = self.conn.cursor()
+            cur.execute("""
+            SELECT *
+            FROM trial_days
+            ORDER BY date DESC
+            LIMIT ?
+            """, (limit,))
+            rows = cur.fetchall()
+            cols = [x[0] for x in cur.description]
+            df = pd.DataFrame([dict(zip(cols, row)) for row in rows])
+            return df.sort_values("date") if not df.empty else df
+        except Exception:
+            return pd.DataFrame()
+
 
 # =========================
 # HELPERS
@@ -820,6 +989,7 @@ class MarketDataCollector:
         df["ma_50"] = df["Close"].rolling(50).mean()
 
         df["rsi"] = self.calculate_rsi(df["Close"])
+        df["volatility_20d"] = df["return_1d"].rolling(20).std()
         df["volume_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
 
         self.db.save_market_data(ticker, df)
@@ -964,8 +1134,8 @@ class MacroNewsCollector:
 class NewsCollector:
     def __init__(self, db: Database):
         self.db = db
-        self.news_api_key = os.getenv("NEWS_API_KEY")
-        self.gnews_api_key = os.getenv("GNEWS_API_KEY")
+        self.news_api_key = secret_value("NEWS_API_KEY")
+        self.gnews_api_key = secret_value("GNEWS_API_KEY")
         self.sentiment = SentimentEngine()
 
     def fetch_for_ticker(self, ticker: str, company_name: str):
@@ -979,15 +1149,20 @@ class NewsCollector:
 
         articles.extend(self.fetch_yahoo_finance_news(ticker))
         articles.extend(self.fetch_rss_fallback(ticker, company_name))
+        articles.extend(self.fetch_company_catalyst_searches(ticker, company_name))
+        articles.extend(self.fetch_shared_catalyst_feeds(ticker, company_name))
 
         filtered_articles = []
 
-        for article in articles:
+        for article in dedupe_news_articles(articles):
+            article = enrich_news_article(article, ticker, company_name, self.sentiment)
+
             if not is_relevant_stock_news(article, ticker, company_name):
                 continue
 
-            article["sentiment"] = self.sentiment.score(article["title"])
-            article["surprise_type"] = detect_surprise_type(article["title"])
+            if article.get("relevance_score", 0) < 45:
+                continue
+
             self.db.save_news(article)
             filtered_articles.append(article)
 
@@ -1113,20 +1288,84 @@ class NewsCollector:
 
         return articles
 
+    def fetch_company_catalyst_searches(self, ticker: str, company_name: str) -> List[Dict]:
+        sector = SECTOR_MAP.get(ticker, "")
+        terms = list(CATALYST_SEARCH_TERMS)
+
+        if sector in ["Healthcare", "Healthcare Software"]:
+            terms.extend(HEALTHCARE_CATALYST_SEARCH_TERMS)
+
+        if sector in ["Technology", "Semiconductors", "AI Infrastructure", "Cloud Software", "AI/Data"]:
+            terms.extend(TECH_CATALYST_SEARCH_TERMS)
+
+        articles = []
+
+        for term in terms:
+            query = f'"{company_name}" OR {ticker} {term} stock'
+            url = f"https://news.google.com/rss/search?q={query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+            articles.extend(self.fetch_rss_url(ticker, "Google News RSS", url))
+
+        return articles
+
+    def fetch_shared_catalyst_feeds(self, ticker: str, company_name: str) -> List[Dict]:
+        articles = []
+        company_terms = [ticker.lower()] + [
+            w.lower() for w in company_name.replace("-", " ").split() if len(w) > 2
+        ]
+
+        for source, url in COMPANY_CATALYST_FEEDS.items():
+            for item in self.fetch_rss_url(ticker, source, url):
+                title = (item.get("title") or "").lower()
+                if any(term in title for term in company_terms) or source == "Nasdaq IPO News":
+                    articles.append(item)
+
+        return articles
+
+    def fetch_rss_url(self, ticker: str, source: str, url: str) -> List[Dict]:
+        try:
+            response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            text = response.text
+        except Exception:
+            return []
+
+        articles = []
+        parts = text.split("<item>")[1:20]
+
+        for part in parts:
+            title = clean_html(extract_between(part, "<title>", "</title>"))
+            link = extract_between(part, "<link>", "</link>")
+            pub_date = extract_between(part, "<pubDate>", "</pubDate>")
+
+            if title:
+                articles.append({
+                    "ticker": ticker,
+                    "title": title,
+                    "source": source,
+                    "url": link or f"{source}:{ticker}:{hash(title)}",
+                    "published_at": parse_rss_date(pub_date),
+                })
+
+        return articles
+
 
 
 def is_relevant_stock_news(article: Dict, ticker: str, company_name: str) -> bool:
     title = (article.get("title") or "").lower()
     source = (article.get("source") or "").lower()
+    relevance = float(article.get("relevance_score") or 0)
     company_words = [w.lower() for w in company_name.replace("-", " ").split() if len(w) > 2]
 
     if any(term in title or term in source for term in NEWS_NOISE_TERMS):
         return False
 
+    if any(term in title for term in LOW_QUALITY_NEWS_TERMS):
+        return False
+
     has_company_match = ticker.lower() in title or any(word in title for word in company_words)
     has_market_context = any(term in title for term in MARKET_TERMS)
+    has_catalyst = article.get("catalyst_type") not in [None, "", "general"]
 
-    return has_company_match and has_market_context
+    return has_company_match and (has_market_context or has_catalyst or relevance >= 65)
 
 def extract_between(text: str, start: str, end: str) -> str:
     try:
@@ -1151,6 +1390,101 @@ def parse_rss_date(value: str) -> str:
         return parsed.isoformat()
     except Exception:
         return now_date()
+
+
+def normalize_headline(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def source_reliability_score(source: str) -> float:
+    source_text = source or ""
+    for key, score in SOURCE_RELIABILITY.items():
+        if key.lower() in source_text.lower():
+            return float(score)
+    return 0.55
+
+
+def classify_catalyst_type(text: str, ticker: str = "", company_name: str = "") -> str:
+    t = normalize_headline(" ".join([text or "", ticker or "", company_name or ""]))
+    for catalyst, terms in CATALYST_KEYWORDS.items():
+        if catalyst == "general":
+            continue
+        if any(term in t for term in terms):
+            return catalyst
+    return "general"
+
+
+def catalyst_bias(catalyst_type: str, sentiment: float) -> float:
+    if catalyst_type in POSITIVE_CATALYST_TYPES:
+        return 8 if sentiment >= -0.15 else 2
+    if catalyst_type in NEGATIVE_CATALYST_TYPES:
+        return -12 if sentiment <= 0.20 else -5
+    if catalyst_type == "earnings":
+        return -6 if not ALLOW_EARNINGS_TRADES else 0
+    if catalyst_type == "guidance":
+        return 6 if sentiment > 0 else -10
+    if catalyst_type == "sec_filing":
+        return -3
+    if catalyst_type == "ipo":
+        return 2
+    if catalyst_type == "macro_policy":
+        return -4 if sentiment < 0 else 1
+    return 0
+
+
+def article_relevance_score(article: Dict, ticker: str, company_name: str) -> float:
+    title = article.get("title") or ""
+    source = article.get("source") or ""
+    t = normalize_headline(title)
+    company_words = [w.lower() for w in company_name.replace("-", " ").split() if len(w) > 2]
+
+    score = 35
+    if ticker.lower() in t:
+        score += 25
+    if any(word in t for word in company_words):
+        score += 20
+    if any(term in t for term in MARKET_TERMS):
+        score += 15
+    if classify_catalyst_type(title, ticker, company_name) != "general":
+        score += 15
+    if any(term in t or term in source.lower() for term in NEWS_NOISE_TERMS):
+        score -= 35
+    if any(term in t for term in LOW_QUALITY_NEWS_TERMS):
+        score -= 25
+
+    return clamp(score)
+
+
+def enrich_news_article(article: Dict, ticker: str, company_name: str, sentiment) -> Dict:
+    title = article.get("title") or ""
+    source = article.get("source") or "Unknown"
+    article["ticker"] = ticker
+    article["source"] = source
+    article["sentiment"] = sentiment.score(title)
+    article["surprise_type"] = detect_surprise_type(title)
+    article["catalyst_type"] = classify_catalyst_type(title, ticker, company_name)
+    article["source_reliability"] = source_reliability_score(source)
+    article["relevance_score"] = article_relevance_score(article, ticker, company_name)
+    return article
+
+
+def dedupe_news_articles(articles: List[Dict]) -> List[Dict]:
+    seen = set()
+    deduped = []
+
+    for article in articles:
+        title_key = normalize_headline(article.get("title") or "")
+        url = (article.get("url") or "").split("?")[0].strip().lower()
+        key = url or title_key
+
+        if not title_key or key in seen:
+            continue
+
+        seen.add(key)
+        deduped.append(article)
+
+    return deduped
 
 
 # =========================
@@ -1290,32 +1624,54 @@ class StockScorer:
             return self.empty_score(ticker, "No market data available")
 
         news_score = self.calculate_news_score(news)
+        catalyst_score = self.calculate_catalyst_score(news)
+        reliability_score = self.calculate_reliability_score(news)
         trend_score = self.trends.google_trend_score(company_name)
         momentum_score = self.calculate_momentum_score(market)
         volume_score = self.calculate_volume_score(market)
+        market_regime_score = self.calculate_market_regime_score()
         macro_risk_score = self.calculate_macro_risk_score(news)
         earnings_risk_score = self.calculate_earnings_risk_score(news)
+        volatility_risk_score = self.calculate_volatility_risk_score(market)
+        sector_concentration_score = self.calculate_sector_concentration_score(ticker)
         confidence_score = self.calculate_confidence_score(news, market)
 
         final_score = (
-            news_score * 0.30 +
-            trend_score * 0.15 +
-            momentum_score * 0.20 +
-            volume_score * 0.10 +
-            macro_risk_score * 0.10 +
-            earnings_risk_score * 0.10 +
-            confidence_score * 0.05
+            news_score * 0.18 +
+            catalyst_score * 0.12 +
+            reliability_score * 0.08 +
+            trend_score * 0.08 +
+            momentum_score * 0.16 +
+            volume_score * 0.08 +
+            market_regime_score * 0.10 +
+            macro_risk_score * 0.08 +
+            earnings_risk_score * 0.06 +
+            volatility_risk_score * 0.04 +
+            sector_concentration_score * 0.02
         )
 
-        signal = self.get_signal(ticker, final_score, market)
+        signal = self.get_signal(
+            ticker,
+            final_score,
+            market,
+            confidence_score,
+            market_regime_score,
+            volatility_risk_score,
+            earnings_risk_score,
+        )
 
         reasons = self.generate_reasons(
             news_score,
+            catalyst_score,
+            reliability_score,
             trend_score,
             momentum_score,
             volume_score,
+            market_regime_score,
             macro_risk_score,
             earnings_risk_score,
+            volatility_risk_score,
+            sector_concentration_score,
             confidence_score,
             signal,
             news,
@@ -1364,12 +1720,17 @@ class StockScorer:
             return 50
 
         weighted_scores = []
+        weights = []
 
         for item in news:
             sentiment = item.get("sentiment") or 0
             surprise = item.get("surprise_type")
+            catalyst = item.get("catalyst_type") or "general"
+            reliability = float(item.get("source_reliability") or 0.55)
+            relevance = float(item.get("relevance_score") or 50)
 
             base = 50 + sentiment * 50
+            base += catalyst_bias(catalyst, sentiment)
 
             if surprise == "unexpected_positive":
                 base += 15
@@ -1381,8 +1742,32 @@ class StockScorer:
                 base -= 5
 
             weighted_scores.append(clamp(base))
+            weights.append(max(0.20, reliability * (relevance / 100)))
 
-        return float(np.mean(weighted_scores))
+        return float(np.average(weighted_scores, weights=weights))
+
+    def calculate_catalyst_score(self, news: List[Dict]) -> float:
+        if not news:
+            return 50
+
+        score = 50
+        for item in news[:12]:
+            catalyst = item.get("catalyst_type") or "general"
+            sentiment = float(item.get("sentiment") or 0)
+            reliability = float(item.get("source_reliability") or 0.55)
+            score += catalyst_bias(catalyst, sentiment) * reliability
+
+        return clamp(score)
+
+    def calculate_reliability_score(self, news: List[Dict]) -> float:
+        if not news:
+            return 45
+
+        values = [
+            float(item.get("source_reliability") or 0.55) * float(item.get("relevance_score") or 50)
+            for item in news[:12]
+        ]
+        return clamp(float(np.mean(values)) if values else 45)
 
     def calculate_momentum_score(self, market: Dict) -> float:
         r5 = market.get("return_5d")
@@ -1435,6 +1820,12 @@ class StockScorer:
 
         return 50
 
+    def calculate_market_regime_score(self) -> float:
+        try:
+            return float(cached_market_regime_snapshot().get("score", 50))
+        except Exception:
+            return 50
+
     def calculate_macro_risk_score(self, news: List[Dict]) -> float:
         macro_news = self.db.recent_macro_news(days=7)
 
@@ -1485,6 +1876,40 @@ class StockScorer:
 
         return 65
 
+    def calculate_volatility_risk_score(self, market: Dict) -> float:
+        vol = float(market.get("volatility_20d") or 0)
+        if vol >= EXTREME_VOLATILITY_20D:
+            return 20
+        if vol >= HIGH_VOLATILITY_20D:
+            return 38
+        if vol >= 0.025:
+            return 52
+        return 68
+
+    def calculate_sector_concentration_score(self, ticker: str) -> float:
+        sector = SECTOR_MAP.get(ticker, "Other")
+        total_value = PaperTrader(self.db).portfolio_value()
+        if total_value <= 0:
+            return 60
+
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT ticker, shares FROM portfolio")
+        sector_value = 0.0
+
+        for held_ticker, shares in cur.fetchall():
+            if SECTOR_MAP.get(held_ticker, "Other") != sector:
+                continue
+            market = self.db.latest_market_row(held_ticker)
+            if market and market.get("close"):
+                sector_value += float(shares) * float(market["close"])
+
+        exposure = sector_value / total_value
+        if exposure >= MAX_SECTOR_EXPOSURE:
+            return 30
+        if exposure >= MAX_SECTOR_EXPOSURE * 0.75:
+            return 45
+        return 65
+
     def calculate_confidence_score(self, news: List[Dict], market: Dict) -> float:
         score = 40
 
@@ -1501,9 +1926,25 @@ class StockScorer:
         if market.get("volume_ratio"):
             score += 15
 
+        reliable_news = [x for x in news if float(x.get("source_reliability") or 0) >= 0.70]
+        if reliable_news:
+            score += min(15, len(reliable_news) * 3)
+
+        if market.get("volatility_20d") and float(market.get("volatility_20d") or 0) >= EXTREME_VOLATILITY_20D:
+            score -= 15
+
         return clamp(score)
 
-    def get_signal(self, ticker: str, score: float, market: Dict) -> str:
+    def get_signal(
+        self,
+        ticker: str,
+        score: float,
+        market: Dict,
+        confidence_score: float = 50,
+        market_regime_score: float = 50,
+        volatility_risk_score: float = 50,
+        earnings_risk_score: float = 50,
+    ) -> str:
         close = market.get("close")
         ma20 = market.get("ma_20")
 
@@ -1515,6 +1956,14 @@ class StockScorer:
                 return "EMERGENCY_SELL"
 
         if score >= BUY_THRESHOLD:
+            if confidence_score < MIN_BUY_CONFIDENCE:
+                return "WATCH"
+            if market_regime_score < 45:
+                return "WATCH"
+            if volatility_risk_score < 35:
+                return "WATCH"
+            if earnings_risk_score < 40:
+                return "WATCH"
             if close and ma20 and close > ma20:
                 return "BUY"
             return "WATCH"
@@ -1527,11 +1976,16 @@ class StockScorer:
     def generate_reasons(
         self,
         news_score,
+        catalyst_score,
+        reliability_score,
         trend_score,
         momentum_score,
         volume_score,
+        market_regime_score,
         macro_risk_score,
         earnings_risk_score,
+        volatility_risk_score,
+        sector_concentration_score,
         confidence_score,
         signal,
         news,
@@ -1545,6 +1999,14 @@ class StockScorer:
             reasons.append("News sentiment is bearish or risk-heavy.")
         else:
             reasons.append("News sentiment is neutral.")
+
+        if catalyst_score >= 65:
+            reasons.append("Recent catalysts are constructive.")
+        elif catalyst_score <= 40:
+            reasons.append("Recent catalysts are risk-heavy.")
+
+        if reliability_score < 45:
+            reasons.append("News quality or source reliability is low.")
 
         if momentum_score >= 70:
             reasons.append("Price momentum is strong.")
@@ -1568,11 +2030,21 @@ class StockScorer:
         if macro_risk_score <= 40:
             reasons.append("Macro or regulatory risk is showing in recent headlines.")
 
+        if market_regime_score < 45:
+            reasons.append("Market regime is risk-off, so buys are restricted.")
+
         if earnings_risk_score <= 40:
             reasons.append("Earnings-related risk is elevated.")
 
+        if volatility_risk_score <= 40:
+            reasons.append("Volatility is high enough to reduce or block new buys.")
+
+        if sector_concentration_score <= 40:
+            reasons.append("Sector concentration risk is elevated.")
+
         if news:
-            reasons.append(f"Top headline: {news[0].get('title')}")
+            top = news[0]
+            reasons.append(f"Top headline ({top.get('catalyst_type', 'general')}): {top.get('title')}")
 
         reasons.append(f"Final signal: {signal}")
 
@@ -1603,6 +2075,71 @@ class PaperTrader:
                 total += float(shares) * float(market["close"])
 
         return total
+
+    def daily_loss_limit_hit(self) -> bool:
+        today = now_date()[:10]
+        current_value = self.portfolio_value()
+        cur = self.db.conn.cursor()
+        cur.execute("""
+        SELECT portfolio_value
+        FROM paper_trades
+        WHERE substr(date, 1, 10) = ?
+        ORDER BY id ASC
+        LIMIT 1
+        """, (today,))
+        row = cur.fetchone()
+
+        if not row or not row[0]:
+            return False
+
+        start_value = float(row[0])
+        if start_value <= 0:
+            return False
+
+        return ((current_value / start_value) - 1) <= MAX_DAILY_LOSS_PCT
+
+    def cooldown_active(self, ticker: str) -> bool:
+        cutoff = (dt.datetime.now() - dt.timedelta(days=LOSS_COOLDOWN_DAYS)).isoformat()
+        cur = self.db.conn.cursor()
+        cur.execute("""
+        SELECT reason
+        FROM paper_trades
+        WHERE ticker = ?
+        AND action IN ('SELL', 'EMERGENCY_SELL')
+        AND date >= ?
+        ORDER BY id DESC
+        LIMIT 1
+        """, (ticker, cutoff))
+        row = cur.fetchone()
+        if not row:
+            return False
+        return "loss" in (row[0] or "").lower() or "stop loss" in (row[0] or "").lower()
+
+    def bad_news_exit_active(self, ticker: str) -> Optional[str]:
+        for item in self.db.recent_news(ticker, days=2):
+            catalyst = item.get("catalyst_type")
+            sentiment = float(item.get("sentiment") or 0)
+            reliability = float(item.get("source_reliability") or 0)
+            relevance = float(item.get("relevance_score") or 0)
+            if catalyst in NEGATIVE_CATALYST_TYPES and sentiment < 0.20 and reliability >= 0.60 and relevance >= 55:
+                return f"Bad news exit: {catalyst} from {item.get('source')}."
+        return None
+
+    def sector_exposure_after_buy(self, ticker: str, dollars_to_add: float) -> float:
+        sector = SECTOR_MAP.get(ticker, "Other")
+        total_value = max(self.portfolio_value(), STARTING_CASH)
+        sector_value = dollars_to_add
+        cur = self.db.conn.cursor()
+        cur.execute("SELECT ticker, shares FROM portfolio")
+
+        for held_ticker, shares in cur.fetchall():
+            if SECTOR_MAP.get(held_ticker, "Other") != sector:
+                continue
+            market = self.db.latest_market_row(held_ticker)
+            if market and market.get("close"):
+                sector_value += float(shares) * float(market["close"])
+
+        return sector_value / total_value
 
     def execute_signal(self, score: Dict):
         ticker = score["ticker"]
@@ -1639,18 +2176,27 @@ class PaperTrader:
 
             exit_reason = None
             exit_action = "SELL"
+            previous = self.db.previous_score(ticker)
+            regime = cached_market_regime_snapshot()
+            bad_news_reason = self.bad_news_exit_active(ticker)
 
             if signal == "EMERGENCY_SELL":
                 exit_reason = "Emergency score drop triggered sell."
                 exit_action = "EMERGENCY_SELL"
             elif return_pct <= STOP_LOSS_PCT:
                 exit_reason = f"Stop loss triggered at {return_pct:.2%}."
+            elif previous and float(previous.get("final_score") or final_score) - final_score >= 15:
+                exit_reason = f"Score deterioration exit. Score fell to {final_score:.1f}."
+            elif bad_news_reason:
+                exit_reason = bad_news_reason
             elif trailing_drawdown <= TRAILING_STOP_PCT:
                 exit_reason = f"Trailing stop triggered at {trailing_drawdown:.2%} from high."
             elif return_pct >= TAKE_PROFIT_PCT:
                 exit_reason = f"Take profit triggered at {return_pct:.2%}."
             elif signal == "SELL" or final_score <= SELL_THRESHOLD:
                 exit_reason = f"AI score sell triggered. Score: {final_score:.1f}."
+            elif regime.get("score", 50) < 35 and final_score < 60:
+                exit_reason = f"Market regime risk-off exit. Regime score: {regime.get('score', 50):.1f}."
             elif hold_days >= MAX_HOLD_DAYS and final_score < BUY_THRESHOLD:
                 exit_reason = f"Max hold period reached: {hold_days} days."
 
@@ -1661,6 +2207,8 @@ class PaperTrader:
                 shares = float(position["shares"])
                 proceeds = shares * price
                 cash_after = cash + proceeds
+                if return_pct < 0:
+                    exit_reason += f" Loss exit return: {return_pct:.2%}."
 
                 self.db.set_cash(cash_after)
                 self.db.upsert_position(ticker, 0, 0)
@@ -1683,6 +2231,12 @@ class PaperTrader:
             if position:
                 return
 
+            if self.daily_loss_limit_hit():
+                return
+
+            if self.cooldown_active(ticker):
+                return
+
             if self.db.open_position_count() >= MAX_OPEN_POSITIONS:
                 return
 
@@ -1692,10 +2246,28 @@ class PaperTrader:
             if self.db.already_traded_today(ticker, "BUY"):
                 return
 
-            max_dollars = total_value * MAX_POSITION_SIZE
+            volatility = float(market.get("volatility_20d") or 0)
+            size_multiplier = 1.0
+
+            if volatility >= EXTREME_VOLATILITY_20D:
+                return
+            elif volatility >= HIGH_VOLATILITY_20D:
+                size_multiplier *= 0.45
+            elif volatility >= 0.025:
+                size_multiplier *= 0.70
+
+            if confidence_score < 65:
+                size_multiplier *= 0.60
+            elif confidence_score >= 85:
+                size_multiplier *= 1.10
+
+            max_dollars = total_value * MAX_POSITION_SIZE * min(size_multiplier, 1.10)
             dollars_to_spend = min(cash, max_dollars)
 
             if dollars_to_spend < MIN_TRADE_DOLLARS:
+                return
+
+            if self.sector_exposure_after_buy(ticker, dollars_to_spend) > MAX_SECTOR_EXPOSURE:
                 return
 
             shares = dollars_to_spend / price
@@ -1843,6 +2415,30 @@ class StockBot:
         final_value = round(self.trader.portfolio_value(), 2)
         status = "OK" if not errors else "PARTIAL_FAILURE"
         self.db.finish_bot_run(run_id, status, errors, final_value)
+
+        try:
+            regime = cached_market_regime_snapshot()
+            plan_df = automation_trade_plan_table(self.db, WATCHLIST, regime)
+            trial_row = record_30_day_trial_snapshot(self.db, plan_df, errors)
+            buys = [x["ticker"] for x in results if x.get("signal") == "BUY"]
+            sells = [x["ticker"] for x in results if x.get("signal") in ["SELL", "EMERGENCY_SELL"]]
+            skipped = int((plan_df["Decision"] == "BLOCKED BUY").sum()) if not plan_df.empty else 0
+            warnings = []
+            if not trial_row.get("safety_pass"):
+                warnings.append("trial safety check failed")
+            if not broker_url_is_paper_only():
+                warnings.append("non-paper Alpaca URL detected")
+            send_email_alert("AI Stock Bot Daily Paper Summary", [
+                f"Status: {status}",
+                f"Portfolio value: ${final_value:,.2f}",
+                f"Buy signals: {', '.join(buys[:10]) if buys else 'none'}",
+                f"Sell signals: {', '.join(sells[:10]) if sells else 'none'}",
+                f"Skipped trades: {skipped}",
+                f"Safety warnings: {', '.join(warnings) if warnings else 'none'}",
+                f"Errors: {'; '.join(errors[:3]) if errors else 'none'}",
+            ])
+        except Exception as e:
+            self.db.log_health_event("WARNING", "trial_alerts", f"Trial snapshot/alert failed: {e}")
 
         print("\nPortfolio value:", final_value)
         print("Bot run status:", status)
@@ -2258,6 +2854,327 @@ def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> D
 
 
 # =========================
+# REALISTIC BACKTEST / WALK-FORWARD HELPERS
+# =========================
+
+def _max_drawdown_from_values(values: List[float]) -> float:
+    peak = None
+    max_dd = 0.0
+    for value in values:
+        if peak is None or value > peak:
+            peak = value
+        if peak and peak > 0:
+            max_dd = min(max_dd, (value / peak) - 1)
+    return max_dd * 100
+
+
+def _sharpe_from_returns(returns: List[float]) -> float:
+    clean = [r for r in returns if r is not None and not pd.isna(r)]
+    if len(clean) < 2:
+        return 0.0
+    std = float(np.std(clean, ddof=1))
+    if std == 0:
+        return 0.0
+    return float(np.mean(clean) / std * math.sqrt(252))
+
+
+def _trade_stats(trades_df: pd.DataFrame) -> Dict:
+    if trades_df.empty:
+        return {"win_rate": 0.0, "average_win": 0.0, "average_loss": 0.0, "profit_factor": 0.0}
+
+    buys = {}
+    pnls = []
+    for _, trade in trades_df.iterrows():
+        ticker = trade["Ticker"]
+        if trade["Action"] == "BUY":
+            buys.setdefault(ticker, []).append(float(trade["Value"]))
+        elif trade["Action"] == "SELL" and buys.get(ticker):
+            pnls.append(float(trade["Value"]) - buys[ticker].pop(0))
+
+    if not pnls:
+        return {"win_rate": 0.0, "average_win": 0.0, "average_loss": 0.0, "profit_factor": 0.0}
+
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x < 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    return {
+        "win_rate": round(len(wins) / len(pnls) * 100, 2),
+        "average_win": round(float(np.mean(wins)) if wins else 0.0, 2),
+        "average_loss": round(float(np.mean(losses)) if losses else 0.0, 2),
+        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss else round(gross_profit, 2),
+    }
+
+
+def _load_simulation_data(period: str = "1y") -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+    prices = {}
+    context = {}
+    context_symbols = {"SPY": "S&P 500", "QQQ": "Nasdaq 100", "^VIX": "VIX", "^TNX": "10Y Yield"}
+    all_symbols = dict(WATCHLIST)
+    all_symbols.update(context_symbols)
+
+    for ticker in all_symbols:
+        try:
+            df = yf.download(ticker, period=period, progress=False, auto_adjust=True)
+            if df.empty:
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.copy()
+            df["return_1d"] = df["Close"].pct_change()
+            df["return_5d"] = df["Close"].pct_change(5)
+            df["return_20d"] = df["Close"].pct_change(20)
+            df["ma_20"] = df["Close"].rolling(20).mean()
+            df["ma_50"] = df["Close"].rolling(50).mean()
+            df["ma_200"] = df["Close"].rolling(200).mean()
+            df["volatility_20d"] = df["return_1d"].rolling(20).std()
+            df["volume_ratio"] = df["Volume"] / df["Volume"].rolling(20).mean()
+            if ticker in WATCHLIST:
+                prices[ticker] = df
+            else:
+                context[ticker] = df
+        except Exception:
+            continue
+
+    return prices, context
+
+
+def _regime_score_for_date(context: Dict[str, pd.DataFrame], current_date) -> float:
+    score = 50
+    for symbol, weight in [("SPY", 15), ("QQQ", 10)]:
+        df = context.get(symbol)
+        if df is not None and current_date in df.index:
+            row = df.loc[current_date]
+            score += weight if row["Close"] > row.get("ma_50", row["Close"]) else -weight
+            if float(row.get("return_5d") or 0) < -0.04:
+                score -= 8
+
+    vix = context.get("^VIX")
+    if vix is not None and current_date in vix.index:
+        vix_price = float(vix.loc[current_date]["Close"])
+        if vix_price > 30:
+            score -= 22
+        elif vix_price > 22:
+            score -= 10
+
+    tnx = context.get("^TNX")
+    if tnx is not None and current_date in tnx.index and float(tnx.loc[current_date].get("return_20d") or 0) > 0.10:
+        score -= 8
+
+    return clamp(score)
+
+
+def _simulate_strategy(
+    prices: Dict[str, pd.DataFrame],
+    context: Dict[str, pd.DataFrame],
+    dates: List,
+    starting_cash: float,
+    buy_threshold: float,
+    sell_threshold: float,
+    max_position_fraction: float = 0.18,
+    slippage_bps: float = BACKTEST_SLIPPAGE_BPS,
+    spread_bps: float = BACKTEST_SPREAD_BPS,
+    fee_per_trade: float = BACKTEST_FEE_PER_TRADE,
+) -> Dict:
+    if len(dates) < 3:
+        return {"summary": {}, "portfolio_history": pd.DataFrame(), "trades": pd.DataFrame(), "benchmark": pd.DataFrame()}
+
+    cash = starting_cash
+    positions = {}
+    trades = []
+    history = []
+    pending_orders = []
+
+    for i in range(1, len(dates)):
+        prev_date = dates[i - 1]
+        current_date = dates[i]
+        fill_cost = 1 + ((slippage_bps + spread_bps) / 10000)
+        sell_cost = 1 - ((slippage_bps + spread_bps) / 10000)
+
+        for order in pending_orders:
+            ticker = order["ticker"]
+            df = prices.get(ticker)
+            if df is None or current_date not in df.index:
+                continue
+            fill_price = float(df.loc[current_date]["Open"])
+            if order["side"] == "buy":
+                price = fill_price * fill_cost
+                spend = min(cash, order["dollars"])
+                if spend <= fee_per_trade or price <= 0:
+                    continue
+                shares = (spend - fee_per_trade) / price
+                cash -= spend
+                positions[ticker] = {"shares": shares, "avg_price": price, "highest_price": price}
+                trades.append({"Date": current_date.date(), "Ticker": ticker, "Action": "BUY", "Price": round(price, 2), "Shares": round(shares, 4), "Value": round(spend, 2), "Score": round(order["score"], 1), "Reason": order["reason"]})
+            elif order["side"] == "sell" and ticker in positions:
+                price = fill_price * sell_cost
+                shares = positions[ticker]["shares"]
+                proceeds = max(0, shares * price - fee_per_trade)
+                cash += proceeds
+                trades.append({"Date": current_date.date(), "Ticker": ticker, "Action": "SELL", "Price": round(price, 2), "Shares": round(shares, 4), "Value": round(proceeds, 2), "Score": round(order["score"], 1), "Reason": order["reason"]})
+                del positions[ticker]
+
+        pending_orders = []
+        regime = _regime_score_for_date(context, prev_date)
+        daily_scores = []
+
+        for ticker, df in prices.items():
+            if prev_date not in df.index:
+                continue
+            row = df.loc[prev_date]
+            price = float(row["Close"])
+            r5 = float(row.get("return_5d") or 0)
+            r20 = float(row.get("return_20d") or 0)
+            vol = float(row.get("volatility_20d") or 0)
+            volume_ratio = float(row.get("volume_ratio") or 1)
+            ma20 = float(row.get("ma_20") or 0)
+            ma50 = float(row.get("ma_50") or 0)
+
+            momentum_score = 50
+            momentum_score += normalize_percent(r5, -0.10, 0.10) * 0.25 - 12.5
+            momentum_score += normalize_percent(r20, -0.20, 0.20) * 0.35 - 17.5
+            momentum_score += 8 if ma20 and price > ma20 else -6
+            momentum_score += 8 if ma50 and price > ma50 else -8
+
+            volume_score = 75 if volume_ratio > 1.8 and r5 > 0 else 30 if volume_ratio > 1.8 and r5 < 0 else 60 if volume_ratio > 1.2 else 50
+            volatility_penalty = 15 if vol > EXTREME_VOLATILITY_20D else 8 if vol > HIGH_VOLATILITY_20D else 0
+            score = clamp(momentum_score * 0.55 + volume_score * 0.20 + regime * 0.25 - volatility_penalty)
+            daily_scores.append({"ticker": ticker, "price": price, "score": score, "r5": r5, "r20": r20, "volatility": vol})
+
+        daily_scores = sorted(daily_scores, key=lambda x: x["score"], reverse=True)
+
+        for ticker in list(positions.keys()):
+            data = next((x for x in daily_scores if x["ticker"] == ticker), None)
+            if not data:
+                continue
+            pos = positions[ticker]
+            current_return = (data["price"] / pos["avg_price"]) - 1
+            pos["highest_price"] = max(pos.get("highest_price", pos["avg_price"]), data["price"])
+            drawdown_from_high = (data["price"] / pos["highest_price"]) - 1
+            reason = None
+            if data["score"] < sell_threshold:
+                reason = "score dropped below sell threshold"
+            elif current_return <= STOP_LOSS_PCT:
+                reason = "stop loss"
+            elif drawdown_from_high <= TRAILING_STOP_PCT:
+                reason = "trailing stop"
+            elif current_return >= TAKE_PROFIT_PCT:
+                reason = "take profit"
+            elif regime < 38 and data["score"] < 58:
+                reason = "risk-off regime"
+            if reason:
+                pending_orders.append({"side": "sell", "ticker": ticker, "score": data["score"], "reason": reason})
+
+        if regime >= 50:
+            candidates = [x for x in daily_scores if x["score"] >= buy_threshold and x["ticker"] not in positions and not any(o["ticker"] == x["ticker"] for o in pending_orders) and x["volatility"] < EXTREME_VOLATILITY_20D and x["r5"] > -0.04 and x["r20"] > -0.08]
+            for data in candidates:
+                if len(positions) + sum(1 for o in pending_orders if o["side"] == "buy") >= MAX_OPEN_POSITIONS:
+                    break
+                spend = min(cash, starting_cash * max_position_fraction * (1.0 if regime >= 65 else 0.55))
+                if data["volatility"] >= HIGH_VOLATILITY_20D:
+                    spend *= 0.55
+                if spend >= 100:
+                    pending_orders.append({"side": "buy", "ticker": data["ticker"], "dollars": spend, "score": data["score"], "reason": "next-day fill after signal"})
+
+        stock_value = 0.0
+        for ticker, pos in positions.items():
+            df = prices.get(ticker)
+            if df is not None and current_date in df.index:
+                stock_value += pos["shares"] * float(df.loc[current_date]["Close"])
+        total_value = cash + stock_value
+        history.append({"Date": current_date.date(), "Portfolio Value": round(total_value, 2), "Cash": round(cash, 2), "Invested": round(stock_value, 2), "Return %": round((total_value / starting_cash - 1) * 100, 2), "Open Positions": len(positions), "Market Regime Score": round(regime, 1)})
+
+    history_df = pd.DataFrame(history)
+    trades_df = pd.DataFrame(trades)
+    daily_returns = history_df["Portfolio Value"].pct_change().dropna().tolist() if not history_df.empty else []
+    trade_stats = _trade_stats(trades_df)
+    benchmark_rows = []
+    for bench in ["SPY", "QQQ"]:
+        dfb = context.get(bench)
+        if dfb is not None and dates[0] in dfb.index and dates[-1] in dfb.index:
+            start_price = float(dfb.loc[dates[0]]["Close"])
+            end_price = float(dfb.loc[dates[-1]]["Close"])
+            final_value = starting_cash * (end_price / start_price)
+            benchmark_rows.append({"Benchmark": bench, "Final Value": round(final_value, 2), "Return %": round((final_value / starting_cash - 1) * 100, 2)})
+
+    final_value = float(history_df["Portfolio Value"].iloc[-1]) if not history_df.empty else starting_cash
+    values = history_df["Portfolio Value"].tolist() if not history_df.empty else [starting_cash]
+    summary = {
+        "starting_cash": starting_cash,
+        "final_value": round(final_value, 2),
+        "profit_loss": round(final_value - starting_cash, 2),
+        "return_percent": round((final_value / starting_cash - 1) * 100, 2),
+        "max_drawdown_percent": round(_max_drawdown_from_values(values), 2),
+        "sharpe_ratio": round(_sharpe_from_returns(daily_returns), 2),
+        "win_rate": trade_stats["win_rate"],
+        "average_win": trade_stats["average_win"],
+        "average_loss": trade_stats["average_loss"],
+        "profit_factor": trade_stats["profit_factor"],
+        "number_of_trades": int(len(trades_df)),
+        "open_positions": int(history_df["Open Positions"].iloc[-1]) if not history_df.empty else 0,
+        "slippage_bps": slippage_bps,
+        "spread_bps": spread_bps,
+        "fee_per_trade": fee_per_trade,
+        "fill_model": "signals from prior close, fills at next trading day open",
+    }
+    return {"summary": summary, "portfolio_history": history_df, "trades": trades_df, "benchmark": pd.DataFrame(benchmark_rows)}
+
+
+def run_algorithm_simulation(starting_cash: float = 10000, days: int = 180) -> Dict:
+    prices, context = _load_simulation_data(period="1y")
+    if not prices:
+        return {"summary": {}, "portfolio_history": pd.DataFrame(), "trades": pd.DataFrame(), "explanations": pd.DataFrame(), "benchmark": pd.DataFrame()}
+    common_dates = sorted(set.intersection(*[set(df.index) for df in prices.values()]))
+    result = _simulate_strategy(prices, context, common_dates[-days:], starting_cash, buy_threshold=68, sell_threshold=48)
+    result["explanations"] = pd.DataFrame()
+    return result
+
+
+def optimize_walk_forward_thresholds(prices: Dict[str, pd.DataFrame], context: Dict[str, pd.DataFrame], train_dates: List, starting_cash: float) -> Tuple[float, float]:
+    best = (68, 48)
+    best_score = -999999
+    for buy_t, sell_t in [(64, 46), (68, 48), (72, 50), (76, 52)]:
+        result = _simulate_strategy(prices, context, train_dates, starting_cash, buy_t, sell_t)
+        summary = result.get("summary", {})
+        score = float(summary.get("return_percent", -999)) + float(summary.get("max_drawdown_percent", 0)) * 0.75
+        if score > best_score:
+            best_score = score
+            best = (buy_t, sell_t)
+    return best
+
+
+def run_walk_forward_test(starting_cash: float = 10000, train_days: int = 120, test_days: int = 30) -> Dict:
+    prices, context = _load_simulation_data(period="2y")
+    if not prices:
+        return {"summary": pd.DataFrame(), "trades": pd.DataFrame(), "history": pd.DataFrame()}
+
+    common_dates = sorted(set.intersection(*[set(df.index) for df in prices.values()]))
+    rows = []
+    all_trades = []
+    all_history = []
+    start = 0
+
+    while start + train_days + test_days <= len(common_dates):
+        train_dates = common_dates[start:start + train_days]
+        test_dates = common_dates[start + train_days - 1:start + train_days + test_days]
+        buy_t, sell_t = optimize_walk_forward_thresholds(prices, context, train_dates, starting_cash)
+        result = _simulate_strategy(prices, context, test_dates, starting_cash, buy_t, sell_t)
+        summary = result.get("summary", {})
+        rows.append({"Train Start": train_dates[0].date(), "Train End": train_dates[-1].date(), "Test Start": test_dates[1].date() if len(test_dates) > 1 else test_dates[0].date(), "Test End": test_dates[-1].date(), "Buy Threshold": buy_t, "Sell Threshold": sell_t, "Return %": summary.get("return_percent", 0), "Max Drawdown %": summary.get("max_drawdown_percent", 0), "Sharpe": summary.get("sharpe_ratio", 0), "Trades": summary.get("number_of_trades", 0)})
+        trades = result.get("trades", pd.DataFrame())
+        history = result.get("portfolio_history", pd.DataFrame())
+        if not trades.empty:
+            trades["Window"] = len(rows)
+            all_trades.append(trades)
+        if not history.empty:
+            history["Window"] = len(rows)
+            all_history.append(history)
+        start += test_days
+
+    return {"summary": pd.DataFrame(rows), "trades": pd.concat(all_trades, ignore_index=True) if all_trades else pd.DataFrame(), "history": pd.concat(all_history, ignore_index=True) if all_history else pd.DataFrame()}
+
+
+# =========================
 # RISK-FIRST ALGORITHM HELPERS
 # =========================
 
@@ -2361,6 +3278,19 @@ def calculate_trade_plan(score: Dict, market: Dict) -> Dict:
 # =========================
 # REGIME + RELATIVE STRENGTH + ALLOCATION ENGINE
 # =========================
+
+_MARKET_REGIME_CACHE = {"date": None, "value": None}
+
+
+def cached_market_regime_snapshot() -> Dict:
+    today = now_date()[:10]
+    if _MARKET_REGIME_CACHE["date"] == today and _MARKET_REGIME_CACHE["value"] is not None:
+        return _MARKET_REGIME_CACHE["value"]
+
+    value = get_market_regime_snapshot()
+    _MARKET_REGIME_CACHE["date"] = today
+    _MARKET_REGIME_CACHE["value"] = value
+    return value
 
 def get_market_regime_snapshot() -> Dict:
     symbols = {
@@ -2890,6 +3820,12 @@ def automation_trade_plan_table(db: Database, watchlist: Dict, regime: Optional[
         risk = get_risk_rating(market)
         signal = score.get("signal")
         position = db.get_position(ticker)
+        close = float(market.get("close") or 0)
+        ma20 = float(market.get("ma_20") or 0)
+        ma50 = float(market.get("ma_50") or 0)
+        rsi = float(market.get("rsi") or 50)
+        volatility = float(market.get("volatility_20d") or 0)
+        trader = PaperTrader(db)
 
         if test_mode != "Off" and ticker == test_ticker:
             if test_mode == "Force Approved Buy":
@@ -2910,11 +3846,6 @@ def automation_trade_plan_table(db: Database, watchlist: Dict, regime: Optional[
         allowed = False
         suggested_dollars = 0.0
         reasons = []
-
-        close = float(market.get("close") or 0)
-        ma20 = float(market.get("ma_20") or 0)
-        ma50 = float(market.get("ma_50") or 0)
-        rsi = float(market.get("rsi") or 50)
 
         if signal == "BUY" and not position:
             decision = "BUY CANDIDATE"
@@ -2941,12 +3872,21 @@ def automation_trade_plan_table(db: Database, watchlist: Dict, regime: Optional[
             if rsi > 78:
                 allowed = False
                 reasons.append("RSI too overbought")
+            if volatility >= EXTREME_VOLATILITY_20D:
+                allowed = False
+                reasons.append("volatility is extreme")
             if current_exposure >= regime["max_exposure"]:
                 allowed = False
                 reasons.append("portfolio exposure already too high")
             if cash <= portfolio_value * regime["cash_minimum"]:
                 allowed = False
                 reasons.append("cash reserve too low")
+            if trader.daily_loss_limit_hit():
+                allowed = False
+                reasons.append("daily loss limit hit")
+            if trader.cooldown_active(ticker):
+                allowed = False
+                reasons.append("cooldown active after losing trade")
 
             if allowed:
                 base_fraction = 0.03
@@ -2969,8 +3909,23 @@ def automation_trade_plan_table(db: Database, watchlist: Dict, regime: Optional[
                 elif risk == "MEDIUM":
                     base_fraction *= 0.75
 
+                if volatility >= HIGH_VOLATILITY_20D:
+                    base_fraction *= 0.45
+                elif volatility >= 0.025:
+                    base_fraction *= 0.70
+                if confidence < 65:
+                    base_fraction *= 0.60
+                elif confidence >= 85:
+                    base_fraction *= 1.10
+
                 suggested_dollars = min(cash, portfolio_value * min(base_fraction, MAX_POSITION_SIZE))
-                reasons.append("approved by automation rules")
+                if trader.sector_exposure_after_buy(ticker, suggested_dollars) > MAX_SECTOR_EXPOSURE:
+                    allowed = False
+                    suggested_dollars = 0
+                    reasons.append("sector concentration limit would be exceeded")
+                    decision = "BLOCKED BUY"
+                else:
+                    reasons.append("approved by automation rules")
             else:
                 decision = "BLOCKED BUY"
 
@@ -3060,6 +4015,20 @@ def fetch_alpaca_account() -> Dict:
 
 
 def submit_alpaca_paper_order(ticker: str, side: str, dollars: float = 0.0) -> Dict:
+    if not broker_url_is_paper_only():
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": "Blocked: Alpaca base URL is not the paper trading endpoint.",
+        }
+
+    if secret_value("ENABLE_LIVE_ORDERS", "false").lower() == "true":
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": "Blocked: ENABLE_LIVE_ORDERS must remain false for this project.",
+        }
+
     if secret_value("ENABLE_BROKER_ORDERS", secret_value("ENABLE_LIVE_ORDERS", "false")).lower() != "true":
         return {
             "ok": False,
@@ -3289,6 +4258,159 @@ def max_daily_broker_orders() -> int:
         return 3
 
 
+def email_alerts_enabled() -> bool:
+    return secret_value("ENABLE_EMAIL_ALERTS", "false").lower() == "true"
+
+
+def email_alert_settings_ready() -> bool:
+    return bool(
+        secret_value("EMAIL_TO")
+        and secret_value("GMAIL_ADDRESS")
+        and secret_value("GMAIL_APP_PASSWORD")
+    )
+
+
+def send_email_alert(title: str, lines: List[str]) -> Dict:
+    if not email_alerts_enabled():
+        return {"ok": False, "skipped": True, "error": "Email alerts disabled."}
+
+    email_to = secret_value("EMAIL_TO")
+    gmail_address = secret_value("GMAIL_ADDRESS")
+    gmail_app_password = secret_value("GMAIL_APP_PASSWORD")
+
+    if not email_to or not gmail_address or not gmail_app_password:
+        return {"ok": False, "skipped": True, "error": "Email alert settings missing."}
+
+    message = EmailMessage()
+    message["Subject"] = title
+    message["From"] = gmail_address
+    message["To"] = email_to
+    message.set_content(title + "\n\n" + "\n".join([f"- {line}" for line in lines[:40]]))
+
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as smtp:
+            smtp.starttls()
+            smtp.login(gmail_address, gmail_app_password)
+            smtp.send_message(message)
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def broker_url_is_paper_only() -> bool:
+    return "paper-api.alpaca.markets" in alpaca_base_url().lower()
+
+
+def record_30_day_trial_snapshot(db: Database, plan_df: pd.DataFrame, errors: Optional[List[str]] = None) -> Dict:
+    trader = PaperTrader(db)
+    errors = errors or []
+    today = now_date()[:10]
+    portfolio_value = trader.portfolio_value()
+    cash = db.get_cash()
+    positions = db.open_position_count()
+    trial_df = db.recent_trial_days(limit=90)
+
+    previous_value = None
+    peak_value = portfolio_value
+    if not trial_df.empty:
+        prior = trial_df[trial_df["date"] < today]
+        if not prior.empty:
+            previous_value = float(prior.iloc[-1]["portfolio_value"])
+            peak_value = max(float(prior["portfolio_value"].max()), portfolio_value)
+
+    daily_return = 0 if not previous_value else (portfolio_value / previous_value - 1) * 100
+    cumulative_return = (portfolio_value / STARTING_CASH - 1) * 100 if STARTING_CASH else 0
+    drawdown = (portfolio_value / peak_value - 1) * 100 if peak_value else 0
+
+    approved_buys = int((plan_df["Decision"] == "BUY CANDIDATE").sum()) if not plan_df.empty else 0
+    approved_sells = int((plan_df["Decision"] == "SELL").sum()) if not plan_df.empty else 0
+    skipped = int((plan_df["Decision"] == "BLOCKED BUY").sum()) if not plan_df.empty else 0
+    signals = int(len(plan_df)) if not plan_df.empty else 0
+    paper_orders = count_today_paper_trades(db)
+
+    alpaca_status = "not_configured"
+    if alpaca_keys_ready():
+        if broker_url_is_paper_only():
+            positions_response = fetch_alpaca_positions()
+            alpaca_status = "ok" if positions_response.get("ok") else "failed"
+            if not positions_response.get("ok"):
+                errors.append(positions_response.get("error", "Alpaca reconciliation failed."))
+        else:
+            alpaca_status = "live_url_detected"
+            errors.append("Live Alpaca URL detected; paper trial safety failed.")
+
+    safety_pass = (
+        broker_url_is_paper_only()
+        and drawdown >= MAX_TRIAL_DRAWDOWN_PCT * 100
+        and not errors
+    )
+
+    row = {
+        "date": today,
+        "signals_generated": signals,
+        "approved_buys": approved_buys,
+        "approved_sells": approved_sells,
+        "skipped_trades": skipped,
+        "paper_orders": paper_orders,
+        "alpaca_reconciliation_status": alpaca_status,
+        "cash": round(cash, 2),
+        "positions": positions,
+        "portfolio_value": round(portfolio_value, 2),
+        "daily_return": round(daily_return, 2),
+        "cumulative_return": round(cumulative_return, 2),
+        "drawdown": round(drawdown, 2),
+        "errors": errors,
+        "safety_pass": safety_pass,
+    }
+    db.save_trial_day(row)
+    return row
+
+
+def evaluate_30_day_trial(db: Database) -> Dict:
+    trial_df = db.recent_trial_days(limit=90)
+    if trial_df.empty:
+        return {
+            "status": "NOT READY FOR REAL MONEY",
+            "passed": False,
+            "reasons": ["No trial days recorded yet."],
+        }
+
+    completed_days = int(len(trial_df))
+    latest = trial_df.iloc[-1]
+    cumulative_return = float(latest.get("cumulative_return") or 0)
+    max_drawdown = float(trial_df["drawdown"].min())
+    total_trades = int(trial_df["paper_orders"].sum())
+    failures = trial_df[
+        (trial_df["safety_pass"] == 0) |
+        (trial_df["alpaca_reconciliation_status"].isin(["failed", "live_url_detected"]))
+    ]
+
+    reasons = []
+    if completed_days < 30:
+        reasons.append(f"Only {completed_days}/30 trading days completed.")
+    if cumulative_return <= 0:
+        reasons.append("Cumulative return is not positive.")
+    if max_drawdown < MAX_TRIAL_DRAWDOWN_PCT * 100:
+        reasons.append(f"Max drawdown {max_drawdown:.2f}% exceeds limit {MAX_TRIAL_DRAWDOWN_PCT * 100:.2f}%.")
+    if not failures.empty:
+        reasons.append("Safety or Alpaca reconciliation failures were recorded.")
+    if total_trades < MIN_TRIAL_TRADES:
+        reasons.append(f"Only {total_trades} paper orders recorded; need at least {MIN_TRIAL_TRADES}.")
+    if not broker_url_is_paper_only():
+        reasons.append("Live Alpaca URL detected.")
+
+    passed = not reasons
+    return {
+        "status": "PAPER TRIAL PASSED - STILL NOT READY FOR REAL MONEY WITHOUT EXPLICIT APPROVAL" if passed else "NOT READY FOR REAL MONEY",
+        "passed": passed,
+        "completed_days": completed_days,
+        "cumulative_return": round(cumulative_return, 2),
+        "max_drawdown": round(max_drawdown, 2),
+        "paper_orders": total_trades,
+        "reasons": reasons or ["All configured paper-trial criteria passed."],
+    }
+
+
 # =========================
 # DASHBOARD
 # =========================
@@ -3473,13 +4595,16 @@ def run_dashboard():
 
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "Market Dashboard",
         "Stock Deep Dive",
-        "Algorithm Simulator",
+        "Backtest",
         "News & Explanations",
         "Risk & Allocation",
-        "Automation Trade Plan",
+        "Alpaca Paper Trading",
+        "Walk-Forward Test",
+        "30-Day Paper Trial",
+        "Real Money Readiness",
     ])
 
     with tab1:
@@ -3591,8 +4716,17 @@ def run_dashboard():
                 s1.metric("Start", f"${summary['starting_cash']:,.2f}")
                 s2.metric("Final Value", f"${summary['final_value']:,.2f}")
                 s3.metric("Profit / Loss", f"${summary['profit_loss']:,.2f}", f"{summary['return_percent']:.2f}%")
-                s4.metric("Peak Value", f"${summary['peak_value']:,.2f}")
+                s4.metric("Max Drawdown", f"{summary.get('max_drawdown_percent', 0):.2f}%")
                 s5.metric("Trades", summary["number_of_trades"])
+
+                q1, q2, q3, q4, q5 = st.columns(5)
+                q1.metric("Sharpe", f"{summary.get('sharpe_ratio', 0):.2f}")
+                q2.metric("Win Rate", f"{summary.get('win_rate', 0):.1f}%")
+                q3.metric("Avg Win", f"${summary.get('average_win', 0):,.2f}")
+                q4.metric("Avg Loss", f"${summary.get('average_loss', 0):,.2f}")
+                q5.metric("Profit Factor", f"{summary.get('profit_factor', 0):.2f}")
+
+                st.caption(f"Fill model: {summary.get('fill_model', 'N/A')}. Slippage: {summary.get('slippage_bps', 0)} bps, spread: {summary.get('spread_bps', 0)} bps, fee/trade: ${summary.get('fee_per_trade', 0):.2f}.")
 
                 st.subheader("Portfolio Value Trend")
                 st.line_chart(history.set_index("Date")[["Portfolio Value", "Cash", "Invested"]], width="stretch")
@@ -3616,6 +4750,17 @@ def run_dashboard():
                     st.info("No trades were triggered during the simulation.")
                 else:
                     st.dataframe(trades, width="stretch", hide_index=True)
+                    st.download_button(
+                        "Download Backtest Trades CSV",
+                        data=trades.to_csv(index=False),
+                        file_name="realistic_backtest_trades.csv",
+                        mime="text/csv",
+                    )
+
+                benchmark = result.get("benchmark", pd.DataFrame())
+                if not benchmark.empty:
+                    st.subheader("Benchmark Comparison")
+                    st.dataframe(benchmark, width="stretch", hide_index=True)
 
     with tab4:
         st.subheader("Official Macro / Government News")
@@ -3992,28 +5137,151 @@ def run_dashboard():
 
         st.warning("Future live trading should only be connected after broker paper trading, logging, kill switches, and order reconciliation are tested.")
 
+    with tab7:
+        st.subheader("Walk-Forward Test")
+        st.caption("Optimizes thresholds only on a training window, then tests them on unseen future data. This reduces overfitting compared with one static backtest.")
+
+        wf_cash = st.number_input("Walk-forward starting cash", min_value=1000, max_value=1000000, value=10000, step=1000)
+        wf_train = st.slider("Training window trading days", min_value=60, max_value=180, value=120, step=30)
+        wf_test = st.slider("Test window trading days", min_value=20, max_value=60, value=30, step=10)
+
+        if st.button("Run Walk-Forward Test"):
+            with st.spinner("Running walk-forward validation..."):
+                wf_result = run_walk_forward_test(starting_cash=wf_cash, train_days=wf_train, test_days=wf_test)
+
+            wf_summary = wf_result.get("summary", pd.DataFrame())
+            wf_trades = wf_result.get("trades", pd.DataFrame())
+            wf_history = wf_result.get("history", pd.DataFrame())
+
+            if wf_summary.empty:
+                st.error("Walk-forward test failed because price data was unavailable.")
+            else:
+                w1, w2, w3, w4 = st.columns(4)
+                w1.metric("Windows", len(wf_summary))
+                w2.metric("Avg Return", f"{float(wf_summary['Return %'].mean()):.2f}%")
+                w3.metric("Avg Drawdown", f"{float(wf_summary['Max Drawdown %'].mean()):.2f}%")
+                w4.metric("Total Trades", int(wf_summary["Trades"].sum()))
+
+                st.dataframe(wf_summary, width="stretch", hide_index=True)
+                st.download_button("Download Walk-Forward Summary CSV", data=wf_summary.to_csv(index=False), file_name="walk_forward_summary.csv", mime="text/csv")
+
+                if not wf_trades.empty:
+                    st.subheader("Walk-Forward Trades")
+                    st.dataframe(wf_trades, width="stretch", hide_index=True)
+                    st.download_button("Download Walk-Forward Trades CSV", data=wf_trades.to_csv(index=False), file_name="walk_forward_trades.csv", mime="text/csv")
+
+                if not wf_history.empty:
+                    st.subheader("Walk-Forward Portfolio History")
+                    st.line_chart(wf_history.set_index("Date")["Portfolio Value"], width="stretch")
+
+    with tab8:
+        st.subheader("30-Day Paper Trial")
+        st.caption("Tracks the live paper-trading trial day by day. This does not enable real-money trading.")
+
+        regime_for_trial = cached_market_regime_snapshot()
+        trial_plan_df = automation_trade_plan_table(db, active_watchlist, regime_for_trial)
+
+        if st.button("Record Today's Paper Trial Snapshot"):
+            trial_errors = []
+            if not broker_url_is_paper_only():
+                trial_errors.append("Live Alpaca URL detected.")
+            trial_row = record_30_day_trial_snapshot(db, trial_plan_df, trial_errors)
+            alert_lines = [
+                f"Signals: {trial_row['signals_generated']}",
+                f"Approved buys: {trial_row['approved_buys']}",
+                f"Approved sells: {trial_row['approved_sells']}",
+                f"Skipped trades: {trial_row['skipped_trades']}",
+                f"Portfolio value: ${trial_row['portfolio_value']:,.2f}",
+                f"Daily return: {trial_row['daily_return']:.2f}%",
+                f"Safety pass: {trial_row['safety_pass']}",
+            ]
+            send_email_alert("AI Stock Bot Paper Trial Summary", alert_lines)
+            st.success("Recorded today's paper trial snapshot.")
+
+        trial_df = db.recent_trial_days(limit=90)
+        trial_eval = evaluate_30_day_trial(db)
+
+        e1, e2, e3, e4, e5 = st.columns(5)
+        e1.metric("Status", trial_eval["status"])
+        e2.metric("Days", trial_eval.get("completed_days", 0))
+        e3.metric("Cumulative Return", f"{trial_eval.get('cumulative_return', 0):.2f}%")
+        e4.metric("Max Drawdown", f"{trial_eval.get('max_drawdown', 0):.2f}%")
+        e5.metric("Paper Orders", trial_eval.get("paper_orders", 0))
+
+        if trial_eval.get("passed"):
+            st.warning("Paper trial criteria passed, but this project is still NOT READY FOR REAL MONEY without explicit human approval and more safety review.")
+        else:
+            st.error("NOT READY FOR REAL MONEY")
+            for reason in trial_eval.get("reasons", []):
+                st.write(f"- {reason}")
+
+        if trial_plan_df.empty:
+            st.info("No current trial plan is available. Refresh data first.")
+        else:
+            st.subheader("Current Trial Decisions")
+            st.dataframe(trial_plan_df, width="stretch", hide_index=True)
+
+        if trial_df.empty:
+            st.info("No 30-day trial snapshots recorded yet.")
+        else:
+            st.subheader("Trial Ledger")
+            st.dataframe(trial_df, width="stretch", hide_index=True)
+            st.line_chart(trial_df.set_index("date")[["portfolio_value", "cash"]], width="stretch")
+            st.download_button("Download 30-Day Trial CSV", data=trial_df.to_csv(index=False), file_name="paper_trial_30_day_log.csv", mime="text/csv")
+
+    with tab9:
+        st.subheader("Real Money Readiness")
+        st.error("NOT READY FOR REAL MONEY")
+        st.caption("This screen is intentionally conservative. Passing the paper trial is not permission to trade real money.")
+
+        readiness = evaluate_30_day_trial(db)
+        safety_checks = {
+            "Live orders disabled": secret_value("ENABLE_LIVE_ORDERS", "false").lower() != "true",
+            "Broker orders blocked by default or paper-only": not secret_value("ENABLE_BROKER_ORDERS", "false").lower() == "true" or broker_url_is_paper_only(),
+            "Alpaca URL is paper": broker_url_is_paper_only(),
+            "30 trading days completed": readiness.get("completed_days", 0) >= 30,
+            "Positive paper-trial return": readiness.get("cumulative_return", 0) > 0,
+            "Drawdown within configured limit": readiness.get("max_drawdown", 0) >= MAX_TRIAL_DRAWDOWN_PCT * 100,
+            "Enough paper orders to evaluate": readiness.get("paper_orders", 0) >= MIN_TRIAL_TRADES,
+            "Email alerts enabled": email_alerts_enabled() and email_alert_settings_ready(),
+        }
+
+        checks_df = pd.DataFrame([
+            {"Check": key, "Passed": value}
+            for key, value in safety_checks.items()
+        ])
+        st.dataframe(checks_df, width="stretch", hide_index=True)
+
+        st.write("Remaining blockers:")
+        for reason in readiness.get("reasons", []):
+            st.write(f"- {reason}")
+
+        st.subheader("Email Alerts")
+        st.caption("Email alerts use Gmail SMTP over TLS. Secrets are only checked for presence and are never displayed.")
+        e_col1, e_col2 = st.columns(2)
+        e_col1.metric("Email Alerts", "ON" if email_alerts_enabled() else "OFF")
+        e_col2.metric("Email Settings", "READY" if email_alert_settings_ready() else "MISSING")
+
+        if email_alerts_enabled() and email_alert_settings_ready():
+            st.success("Email alerts are enabled.")
+        elif email_alerts_enabled():
+            st.warning("Email alerts are enabled, but EMAIL_TO, GMAIL_ADDRESS, or GMAIL_APP_PASSWORD is missing.")
+        else:
+            st.info("Email alerts are off by default. Set ENABLE_EMAIL_ALERTS=true and add Gmail settings to enable them.")
+
 
 # =========================
 # UTILITY COMMANDS
 # =========================
 
 def run_backtest():
-    backtester = Backtester()
-    results = []
+    result = run_algorithm_simulation(starting_cash=STARTING_CASH, days=180)
+    summary = result.get("summary", {})
+    if not summary:
+        print("Backtest failed because price data was unavailable.")
+        return
 
-    for ticker in active_watchlist:
-        result = backtester.simple_momentum_backtest(ticker)
-        results.append(result)
-
-    df = pd.DataFrame(results)
-    print(df[[
-        "ticker",
-        "strategy_final_value",
-        "strategy_return_percent",
-        "buy_hold_final_value",
-        "buy_hold_return_percent",
-        "number_of_trades",
-    ]])
+    print(json.dumps(summary, indent=2))
 
 
 # =========================
