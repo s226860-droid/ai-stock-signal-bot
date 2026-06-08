@@ -2879,6 +2879,62 @@ def submit_alpaca_paper_order(ticker: str, side: str, dollars: float = 0.0) -> D
         }
 
 
+
+def automation_safety_snapshot(db: Database, plan_df: pd.DataFrame) -> Dict:
+    trader = PaperTrader(db)
+    portfolio_value = trader.portfolio_value()
+    cash = db.get_cash()
+    exposure = 0 if portfolio_value <= 0 else max(0, min(1, (portfolio_value - cash) / portfolio_value))
+
+    approved = plan_df[plan_df["Decision"].isin(["BUY CANDIDATE", "SELL"])] if not plan_df.empty else pd.DataFrame()
+    approved_buy_dollars = 0.0
+    if not approved.empty and "Suggested Dollars" in approved.columns:
+        approved_buy_dollars = float(approved[approved["Decision"] == "BUY CANDIDATE"]["Suggested Dollars"].sum())
+
+    warnings = []
+
+    if exposure > 0.80:
+        warnings.append("Portfolio exposure is above 80%.")
+    if cash < portfolio_value * 0.10:
+        warnings.append("Cash is below 10% of portfolio value.")
+    if approved_buy_dollars > portfolio_value * 0.25:
+        warnings.append("Approved buy dollars exceed 25% of portfolio value.")
+    if len(approved) > 5:
+        warnings.append("More than 5 actions are approved in one run.")
+
+    status = "OK"
+    if warnings:
+        status = "CAUTION"
+    if exposure > 0.95 or approved_buy_dollars > portfolio_value * 0.40:
+        status = "BLOCK"
+
+    return {
+        "portfolio_value": round(portfolio_value, 2),
+        "cash": round(cash, 2),
+        "exposure_percent": round(exposure * 100, 1),
+        "approved_actions": int(len(approved)),
+        "approved_buy_dollars": round(approved_buy_dollars, 2),
+        "status": status,
+        "warnings": warnings,
+    }
+
+
+def get_recent_trade_journal(db: Database, limit: int = 50) -> pd.DataFrame:
+    try:
+        cur = db.conn.cursor()
+        cur.execute("""
+            SELECT date, ticker, action, shares, price, cash_after, portfolio_value, reason
+            FROM paper_trades
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,))
+        rows = cur.fetchall()
+        cols = [x[0] for x in cur.description]
+        return pd.DataFrame([dict(zip(cols, row)) for row in rows])
+    except Exception:
+        return pd.DataFrame()
+
+
 # =========================
 # DASHBOARD
 # =========================
@@ -3477,6 +3533,51 @@ def run_dashboard():
                         st.error(result.get("error", "Order failed."))
 
                     st.json(result)
+
+        st.divider()
+        st.subheader("Safety & Order Journal")
+        st.caption("These controls help prevent the bot from taking too much risk when future order sending is enabled.")
+
+        safety = automation_safety_snapshot(db, plan_df if "plan_df" in locals() else pd.DataFrame())
+
+        sg1, sg2, sg3, sg4, sg5 = st.columns(5)
+        sg1.metric("Safety Status", safety["status"])
+        sg2.metric("Portfolio Value", f"${safety['portfolio_value']:,.2f}")
+        sg3.metric("Cash", f"${safety['cash']:,.2f}")
+        sg4.metric("Exposure", f"{safety['exposure_percent']:.1f}%")
+        sg5.metric("Approved Buy $", f"${safety['approved_buy_dollars']:,.2f}")
+
+        if safety["status"] == "BLOCK":
+            st.error("Safety engine would block new buy orders.")
+        elif safety["status"] == "CAUTION":
+            st.warning("Safety engine is cautious: " + " ".join(safety["warnings"]))
+        else:
+            st.success("Safety engine status is OK.")
+
+        emergency_stop = st.checkbox(
+            "Emergency stop: block all future order sending from the UI",
+            value=True,
+            key="automation_emergency_stop",
+        )
+
+        if emergency_stop:
+            st.info("Emergency stop is ON. The UI should not send orders even if broker settings are later enabled.")
+        else:
+            st.warning("Emergency stop is OFF. Only disable this during controlled paper-trading tests.")
+
+        journal_df = get_recent_trade_journal(db)
+
+        st.subheader("Recent Paper Trade Journal")
+        if journal_df.empty:
+            st.info("No paper trades have been logged yet.")
+        else:
+            st.dataframe(journal_df, width="stretch", hide_index=True)
+            st.download_button(
+                "Download Trade Journal CSV",
+                data=journal_df.to_csv(index=False),
+                file_name="paper_trade_journal.csv",
+                mime="text/csv",
+            )
 
         st.warning("Future live trading should only be connected after broker paper trading, logging, kill switches, and order reconciliation are tested.")
 
