@@ -2935,6 +2935,99 @@ def get_recent_trade_journal(db: Database, limit: int = 50) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+
+def fetch_alpaca_orders(status: str = "all", limit: int = 50) -> Dict:
+    if not alpaca_keys_ready():
+        return {
+            "ok": False,
+            "error": "Missing ALPACA_API_KEY or ALPACA_SECRET_KEY.",
+            "data": [],
+        }
+
+    try:
+        url = f"{alpaca_base_url()}/v2/orders"
+        params = {
+            "status": status,
+            "limit": limit,
+            "direction": "desc",
+        }
+        r = requests.get(url, headers=alpaca_headers(), params=params, timeout=15)
+        data = r.json()
+        return {
+            "ok": r.status_code == 200,
+            "status_code": r.status_code,
+            "data": data if isinstance(data, list) else [],
+            "error": data.get("message") if isinstance(data, dict) else None,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "data": [],
+        }
+
+
+def fetch_alpaca_positions() -> Dict:
+    if not alpaca_keys_ready():
+        return {
+            "ok": False,
+            "error": "Missing ALPACA_API_KEY or ALPACA_SECRET_KEY.",
+            "data": [],
+        }
+
+    try:
+        url = f"{alpaca_base_url()}/v2/positions"
+        r = requests.get(url, headers=alpaca_headers(), timeout=15)
+        data = r.json()
+        return {
+            "ok": r.status_code == 200,
+            "status_code": r.status_code,
+            "data": data if isinstance(data, list) else [],
+            "error": data.get("message") if isinstance(data, dict) else None,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "data": [],
+        }
+
+
+def alpaca_orders_dataframe(raw_orders: List[Dict]) -> pd.DataFrame:
+    rows = []
+    for order in raw_orders:
+        rows.append({
+            "Submitted At": order.get("submitted_at"),
+            "Symbol": order.get("symbol"),
+            "Side": order.get("side"),
+            "Type": order.get("type"),
+            "Status": order.get("status"),
+            "Qty": order.get("qty"),
+            "Notional": order.get("notional"),
+            "Filled Qty": order.get("filled_qty"),
+            "Filled Avg Price": order.get("filled_avg_price"),
+            "Time In Force": order.get("time_in_force"),
+            "Order ID": order.get("id"),
+        })
+    return pd.DataFrame(rows)
+
+
+def alpaca_positions_dataframe(raw_positions: List[Dict]) -> pd.DataFrame:
+    rows = []
+    for pos in raw_positions:
+        rows.append({
+            "Symbol": pos.get("symbol"),
+            "Qty": pos.get("qty"),
+            "Market Value": pos.get("market_value"),
+            "Avg Entry Price": pos.get("avg_entry_price"),
+            "Current Price": pos.get("current_price"),
+            "Unrealized P/L": pos.get("unrealized_pl"),
+            "Unrealized P/L %": pos.get("unrealized_plpc"),
+            "Side": pos.get("side"),
+        })
+    return pd.DataFrame(rows)
+
+
 # =========================
 # DASHBOARD
 # =========================
@@ -3578,6 +3671,59 @@ def run_dashboard():
                 file_name="paper_trade_journal.csv",
                 mime="text/csv",
             )
+
+        st.divider()
+        st.subheader("Alpaca Order Reconciliation")
+        st.caption("After a paper order is submitted, this section verifies broker orders and current paper positions directly from Alpaca.")
+
+        if not alpaca_keys_ready():
+            st.info("Add Alpaca paper API keys before order reconciliation can connect.")
+        else:
+            col_orders, col_positions = st.columns(2)
+
+            with col_orders:
+                st.write("Recent Alpaca Orders")
+                order_status_filter = st.selectbox(
+                    "Order status filter",
+                    ["all", "open", "closed"],
+                    index=0,
+                    key="alpaca_order_status_filter",
+                )
+                orders_response = fetch_alpaca_orders(status=order_status_filter, limit=50)
+
+                if orders_response.get("ok"):
+                    orders_df = alpaca_orders_dataframe(orders_response.get("data", []))
+                    if orders_df.empty:
+                        st.info("No Alpaca orders found.")
+                    else:
+                        st.dataframe(orders_df, width="stretch", hide_index=True)
+                        st.download_button(
+                            "Download Alpaca Orders CSV",
+                            data=orders_df.to_csv(index=False),
+                            file_name="alpaca_orders.csv",
+                            mime="text/csv",
+                        )
+                else:
+                    st.error(orders_response.get("error", "Could not fetch Alpaca orders."))
+
+            with col_positions:
+                st.write("Current Alpaca Positions")
+                positions_response = fetch_alpaca_positions()
+
+                if positions_response.get("ok"):
+                    positions_df = alpaca_positions_dataframe(positions_response.get("data", []))
+                    if positions_df.empty:
+                        st.info("No Alpaca paper positions found.")
+                    else:
+                        st.dataframe(positions_df, width="stretch", hide_index=True)
+                        st.download_button(
+                            "Download Alpaca Positions CSV",
+                            data=positions_df.to_csv(index=False),
+                            file_name="alpaca_positions.csv",
+                            mime="text/csv",
+                        )
+                else:
+                    st.error(positions_response.get("error", "Could not fetch Alpaca positions."))
 
         st.warning("Future live trading should only be connected after broker paper trading, logging, kill switches, and order reconciliation are tested.")
 
