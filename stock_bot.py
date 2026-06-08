@@ -41,6 +41,52 @@ except ImportError:
     TrendReq = None
 
 
+
+# =========================
+# ENV / SECRET HELPERS
+# =========================
+
+def load_local_env_file(path: str = ".env") -> None:
+    """Load simple KEY=VALUE pairs from .env without requiring python-dotenv."""
+    env_path = Path(path)
+    if not env_path.exists():
+        return
+
+    try:
+        for raw_line in env_path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        pass
+
+
+def secret_value(name: str, default: str = "") -> str:
+    """Read from environment variables first, then Streamlit secrets if available."""
+    value = os.getenv(name)
+    if value:
+        return str(value)
+
+    try:
+        import streamlit as st
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+
+    return default
+
+
+load_local_env_file()
+
+
 # =========================
 # CONFIG
 # =========================
@@ -2782,18 +2828,18 @@ def automation_trade_plan_table(db: Database, watchlist: Dict, regime: Optional[
 
 def alpaca_headers() -> Dict:
     return {
-        "APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY", ""),
-        "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET_KEY", ""),
+        "APCA-API-KEY-ID": secret_value("ALPACA_API_KEY", ""),
+        "APCA-API-SECRET-KEY": secret_value("ALPACA_SECRET_KEY", ""),
         "Content-Type": "application/json",
     }
 
 
 def alpaca_base_url() -> str:
-    return os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    return secret_value("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 
 def alpaca_keys_ready() -> bool:
-    return bool(os.getenv("ALPACA_API_KEY") and os.getenv("ALPACA_SECRET_KEY"))
+    return bool(secret_value("ALPACA_API_KEY") and secret_value("ALPACA_SECRET_KEY"))
 
 
 def fetch_alpaca_account() -> Dict:
@@ -2821,7 +2867,7 @@ def fetch_alpaca_account() -> Dict:
 
 
 def submit_alpaca_paper_order(ticker: str, side: str, dollars: float = 0.0) -> Dict:
-    if os.getenv("ENABLE_LIVE_ORDERS", "false").lower() != "true":
+    if secret_value("ENABLE_LIVE_ORDERS", "false").lower() != "true":
         return {
             "ok": False,
             "blocked": True,
@@ -3474,9 +3520,9 @@ def run_dashboard():
         st.subheader("Automation Trade Plan")
         st.caption("This is the bridge toward future automated buying and selling. It does not place real orders. It shows what the bot would approve, block, hold, or sell based on current scores and risk rules.")
 
-        broker_mode = os.getenv("BROKER_MODE", "database_paper")
-        live_orders = os.getenv("ENABLE_LIVE_ORDERS", "false").lower() == "true"
-        manual_approval = os.getenv("MANUAL_APPROVAL_REQUIRED", "true").lower() == "true"
+        broker_mode = secret_value("BROKER_MODE", "database_paper")
+        live_orders = secret_value("ENABLE_LIVE_ORDERS", "false").lower() == "true"
+        manual_approval = secret_value("MANUAL_APPROVAL_REQUIRED", "true").lower() == "true"
 
         a1, a2, a3, a4 = st.columns(4)
         a1.metric("Broker Mode", broker_mode)
