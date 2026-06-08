@@ -3075,6 +3075,28 @@ def alpaca_positions_dataframe(raw_positions: List[Dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+def count_today_paper_trades(db: Database) -> int:
+    try:
+        cur = db.conn.cursor()
+        today = dt.datetime.now().date().isoformat()
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM paper_trades
+            WHERE substr(date, 1, 10) = ?
+        """, (today,))
+        return int(cur.fetchone()[0])
+    except Exception:
+        return 0
+
+
+def max_daily_broker_orders() -> int:
+    try:
+        return int(secret_value("MAX_DAILY_BROKER_ORDERS", "3"))
+    except Exception:
+        return 3
+
+
 # =========================
 # DASHBOARD
 # =========================
@@ -3680,12 +3702,16 @@ def run_dashboard():
 
         safety = automation_safety_snapshot(db, plan_df if "plan_df" in locals() else pd.DataFrame())
 
-        sg1, sg2, sg3, sg4, sg5 = st.columns(5)
+        today_trade_count = count_today_paper_trades(db)
+        daily_order_limit = max_daily_broker_orders()
+
+        sg1, sg2, sg3, sg4, sg5, sg6 = st.columns(6)
         sg1.metric("Safety Status", safety["status"])
         sg2.metric("Portfolio Value", f"${safety['portfolio_value']:,.2f}")
         sg3.metric("Cash", f"${safety['cash']:,.2f}")
         sg4.metric("Exposure", f"{safety['exposure_percent']:.1f}%")
         sg5.metric("Approved Buy $", f"${safety['approved_buy_dollars']:,.2f}")
+        sg6.metric("Today's Trades", f"{today_trade_count}/{daily_order_limit}")
 
         if safety["status"] == "BLOCK":
             st.error("Safety engine would block new buy orders.")
