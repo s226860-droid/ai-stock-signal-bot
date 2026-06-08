@@ -2779,6 +2779,106 @@ def automation_trade_plan_table(db: Database, watchlist: Dict, regime: Optional[
     return out.drop(columns=["_priority"])
 
 
+
+def alpaca_headers() -> Dict:
+    return {
+        "APCA-API-KEY-ID": os.getenv("ALPACA_API_KEY", ""),
+        "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET_KEY", ""),
+        "Content-Type": "application/json",
+    }
+
+
+def alpaca_base_url() -> str:
+    return os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+
+def alpaca_keys_ready() -> bool:
+    return bool(os.getenv("ALPACA_API_KEY") and os.getenv("ALPACA_SECRET_KEY"))
+
+
+def fetch_alpaca_account() -> Dict:
+    if not alpaca_keys_ready():
+        return {
+            "ok": False,
+            "error": "Missing ALPACA_API_KEY or ALPACA_SECRET_KEY.",
+        }
+
+    try:
+        url = f"{alpaca_base_url()}/v2/account"
+        r = requests.get(url, headers=alpaca_headers(), timeout=15)
+        data = r.json()
+        return {
+            "ok": r.status_code == 200,
+            "status_code": r.status_code,
+            "data": data,
+            "error": data.get("message") if isinstance(data, dict) else None,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
+def submit_alpaca_paper_order(ticker: str, side: str, dollars: float = 0.0) -> Dict:
+    if os.getenv("ENABLE_LIVE_ORDERS", "false").lower() != "true":
+        return {
+            "ok": False,
+            "blocked": True,
+            "error": "ENABLE_LIVE_ORDERS is false, so no Alpaca order was sent.",
+        }
+
+    if not alpaca_keys_ready():
+        return {
+            "ok": False,
+            "error": "Missing ALPACA_API_KEY or ALPACA_SECRET_KEY.",
+        }
+
+    if not ticker:
+        return {
+            "ok": False,
+            "error": "Missing ticker.",
+        }
+
+    payload = {
+        "symbol": ticker,
+        "side": side,
+        "type": "market",
+        "time_in_force": "day",
+    }
+
+    if side == "buy":
+        if dollars <= 0:
+            return {
+                "ok": False,
+                "error": "Buy order needs dollars greater than 0.",
+            }
+        payload["notional"] = round(float(dollars), 2)
+    else:
+        payload["qty"] = "all"
+
+    try:
+        url = f"{alpaca_base_url()}/v2/orders"
+        r = requests.post(url, headers=alpaca_headers(), json=payload, timeout=15)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw_text": r.text}
+
+        return {
+            "ok": 200 <= r.status_code < 300,
+            "status_code": r.status_code,
+            "data": data,
+            "payload": payload,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "payload": payload,
+        }
+
+
 # =========================
 # DASHBOARD
 # =========================
@@ -3306,6 +3406,77 @@ def run_dashboard():
                 st.info("No blocked buy signals right now.")
             else:
                 st.dataframe(blocked[["Ticker", "Company", "Score", "Risk Adjusted Score", "Confidence", "Risk", "Main Reason"]], width="stretch", hide_index=True)
+
+            st.divider()
+            st.subheader("Alpaca Paper Trading Connection")
+            st.caption("Connects the bot to Alpaca paper trading. This is for fake broker orders first, not real money.")
+
+            alpaca_ready = alpaca_keys_ready()
+            account_response = fetch_alpaca_account()
+
+            ap1, ap2, ap3, ap4 = st.columns(4)
+            ap1.metric("Alpaca Keys", "FOUND" if alpaca_ready else "MISSING")
+            ap2.metric("Base URL", "PAPER" if "paper-api" in alpaca_base_url() else "LIVE URL")
+            ap3.metric("Order Sending", "ENABLED" if live_orders else "BLOCKED")
+            ap4.metric("Connection", "OK" if account_response.get("ok") else "NOT CONNECTED")
+
+            if account_response.get("ok"):
+                acct = account_response.get("data", {})
+                ac1, ac2, ac3, ac4 = st.columns(4)
+                ac1.metric("Equity", f"${float(acct.get('equity', 0)):,.2f}")
+                ac2.metric("Buying Power", f"${float(acct.get('buying_power', 0)):,.2f}")
+                ac3.metric("Cash", f"${float(acct.get('cash', 0)):,.2f}")
+                ac4.metric("Pattern Day Trader", str(acct.get("pattern_day_trader", "N/A")))
+                st.success("Alpaca paper account connected.")
+            else:
+                st.info(account_response.get("error", "Alpaca is not connected yet."))
+
+            st.subheader("Paper Order Test")
+            st.caption("This uses the approved automation plan. It will only send an Alpaca order if Alpaca keys exist and ENABLE_LIVE_ORDERS=true.")
+
+            executable = plan_df[plan_df["Decision"].isin(["BUY CANDIDATE", "SELL"])].copy()
+
+            if executable.empty:
+                st.info("No approved buy or sell actions are available for paper order testing. Use Force Test Mode to test the UI.")
+            else:
+                order_labels = [
+                    f"{row['Decision']} | {row['Ticker']} | ${float(row['Suggested Dollars']):,.2f}"
+                    for _, row in executable.iterrows()
+                ]
+
+                selected_order_label = st.selectbox("Choose approved action", order_labels, key="alpaca_order_select")
+                selected_index = order_labels.index(selected_order_label)
+                selected_order = executable.iloc[selected_index]
+
+                st.write("Selected order:")
+                st.json({
+                    "ticker": selected_order["Ticker"],
+                    "decision": selected_order["Decision"],
+                    "suggested_dollars": float(selected_order["Suggested Dollars"]),
+                    "score": float(selected_order["Score"]),
+                    "risk_adjusted_score": float(selected_order["Risk Adjusted Score"]),
+                    "confidence": float(selected_order["Confidence"]),
+                    "reason": selected_order["Main Reason"],
+                })
+
+                confirm_order = st.checkbox("I understand this is for Alpaca paper trading and should not be used with real money yet.", key="alpaca_confirm")
+
+                if st.button("Submit Alpaca Paper Order", disabled=not confirm_order):
+                    side = "buy" if selected_order["Decision"] == "BUY CANDIDATE" else "sell"
+                    result = submit_alpaca_paper_order(
+                        ticker=selected_order["Ticker"],
+                        side=side,
+                        dollars=float(selected_order["Suggested Dollars"]),
+                    )
+
+                    if result.get("ok"):
+                        st.success("Paper order submitted to Alpaca.")
+                    elif result.get("blocked"):
+                        st.warning(result.get("error"))
+                    else:
+                        st.error(result.get("error", "Order failed."))
+
+                    st.json(result)
 
         st.warning("Future live trading should only be connected after broker paper trading, logging, kill switches, and order reconciliation are tested.")
 
